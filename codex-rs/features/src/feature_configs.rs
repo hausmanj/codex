@@ -363,6 +363,8 @@ pub enum CurrentTimeReminderDeliveryMode {
     AnyInference,
     /// Allow reminders after user input or tool output; new context windows still force one.
     AfterUserOrToolOutput,
+    /// Instruct a local model to update its rolling session-memory checkpoint when due.
+    CheckpointMemory,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

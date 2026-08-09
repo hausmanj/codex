@@ -891,6 +891,20 @@ sleep_tool = true
                 sleep_tool: true,
             },
         ),
+        (
+            r#"
+[features.current_time_reminder]
+enabled = true
+reminder_interval_seconds = 300
+delivery_mode = "checkpoint_memory"
+"#,
+            CurrentTimeReminderConfig {
+                reminder_interval_seconds: 300,
+                clock_source: CurrentTimeSource::System,
+                delivery_mode: CurrentTimeReminderDeliveryMode::CheckpointMemory,
+                sleep_tool: false,
+            },
+        ),
     ] {
         let config = load_current_time_reminder_config(config_toml).await?;
         assert!(config.features.enabled(Feature::CurrentTimeReminder));

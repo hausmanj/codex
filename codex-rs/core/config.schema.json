@@ -1099,6 +1099,13 @@
             "after_user_or_tool_output"
           ],
           "type": "string"
+        },
+        {
+          "description": "Instruct a local model to update its rolling session-memory checkpoint when due.",
+          "enum": [
+            "checkpoint_memory"
+          ],
+          "type": "string"
         }
       ]
     },
