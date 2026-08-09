@@ -352,6 +352,55 @@ async fn system_time_source_adds_current_time_reminder() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_memory_reminder_targets_the_qwen_memory_file() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            enable_current_time_reminder(
+                config,
+                /*interval*/ 300,
+                CurrentTimeSource::External,
+            );
+            config
+                .current_time_reminder
+                .as_mut()
+                .expect("current-time reminder should be configured")
+                .delivery_mode = CurrentTimeReminderDeliveryMode::CheckpointMemory;
+        })
+        .with_external_time_provider(Arc::new(TestTimeProvider::default()))
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("keep working").await?;
+
+    let reminders = current_time_reminders(&responses.single_request());
+    assert_eq!(reminders.len(), 1);
+    let reminder = &reminders[0];
+    for expected in [
+        ".qwen/codex/SESSION_MEMORY.md",
+        "Rolling Summary",
+        "newest 10 detailed checkpoints",
+        "checkpoint 11",
+        "exact next action",
+    ] {
+        assert!(
+            reminder.contains(expected),
+            "checkpoint instruction should contain {expected:?}: {reminder:?}"
+        );
+    }
+    assert!(!reminder.contains(".codex/SESSION_MEMORY.md"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_time_reminder_is_refreshed_after_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

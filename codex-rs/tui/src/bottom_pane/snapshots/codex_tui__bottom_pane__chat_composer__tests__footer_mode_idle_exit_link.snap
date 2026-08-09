@@ -1,13 +1,14 @@
 ---
 source: tui/src/bottom_pane/chat_composer.rs
+assertion_line: 5178
 expression: terminal.backend()
 ---
 "                                                                                                    "
-"› [Image #1][Image #2]                                                                              "
+"› Ask Codex to do anything                                                                          "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
-"                                                                           100% context left    exit"
+"  ? for shortcuts                                                          100% context left    exit"
