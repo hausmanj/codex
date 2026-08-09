@@ -317,6 +317,7 @@ use codex_file_search::FileMatch;
 #[cfg(test)]
 use codex_plugin::AppConnectorId;
 use codex_plugin::PluginCapabilitySummary;
+use std::cell::Cell;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -521,6 +522,7 @@ pub(crate) struct ChatComposer {
     history_search_next_keys: Vec<KeyBinding>,
     editor_keymap: Arc<EditorKeymap>,
     vim_normal_keymap: VimNormalKeymap,
+    exit_link_rect: Cell<Option<Rect>>,
 }
 
 /// A resolved legacy `$` target plus any catalog built while disambiguating shell syntax.
@@ -555,6 +557,9 @@ pub(crate) struct ComposerDraftSnapshot {
 }
 
 const FOOTER_SPACING_HEIGHT: u16 = 0;
+const EXIT_LINK_LABEL: &str = "exit";
+const EXIT_LINK_WIDTH: u16 = 4;
+const EXIT_LINK_GAP: u16 = 2;
 
 impl ChatComposer {
     fn slash_input(&self) -> SlashInput<'_> {
@@ -696,6 +701,7 @@ impl ChatComposer {
             history_search_next_keys: default_keymap.composer.history_search_next.clone(),
             editor_keymap: default_editor_keymap,
             vim_normal_keymap: default_vim_normal_keymap,
+            exit_link_rect: Cell::new(None),
         };
         this.draft.textarea.set_keymap_bindings(&default_keymap);
         // Apply configuration via the setter to keep side-effects centralized.
@@ -4499,6 +4505,12 @@ impl ChatComposer {
 }
 
 impl ChatComposer {
+    pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
+        self.exit_link_rect.get().is_some_and(|rect| {
+            column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
+        })
+    }
+
     pub(crate) fn render_with_mask(&self, area: Rect, buf: &mut Buffer, mask_char: Option<char>) {
         self.render_with_mask_and_textarea_right_reserve(
             area, buf, mask_char, /*textarea_right_reserve*/ 0,
@@ -4512,6 +4524,7 @@ impl ChatComposer {
         mask_char: Option<char>,
         textarea_right_reserve: u16,
     ) {
+        self.exit_link_rect.set(None);
         let [composer_rect, remote_images_rect, textarea_rect, popup_rect] =
             self.layout_areas_with_textarea_right_reserve(area, textarea_right_reserve);
         match &self.popups.active {
@@ -4646,8 +4659,19 @@ impl ChatComposer {
                             Some(self.right_footer_line_with_context())
                         };
                     let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
+                    let exit_reserve = if matches!(
+                        footer_props.mode,
+                        FooterMode::ComposerEmpty | FooterMode::ComposerHasDraft
+                    ) && hint_rect.width >= EXIT_LINK_WIDTH
+                    {
+                        EXIT_LINK_WIDTH.saturating_add(EXIT_LINK_GAP)
+                    } else {
+                        0
+                    };
+                    let reserved_right_width = right_width.saturating_add(exit_reserve);
                     if status_line_active
-                        && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
+                        && let Some(max_left) =
+                            max_left_width_for_right(hint_rect, reserved_right_width)
                         && left_width > max_left
                         && let Some(line) = combined_status_line.as_ref().map(|line| {
                             truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
@@ -4657,7 +4681,7 @@ impl ChatComposer {
                         truncated_status_line = Some(line);
                     }
                     let can_show_left_and_context =
-                        can_show_left_with_context(hint_rect, left_width, right_width);
+                        can_show_left_with_context(hint_rect, left_width, reserved_right_width);
                     let has_override =
                         self.footer.flash_visible() || active_footer_hint_override.is_some();
                     let single_line_layout = if has_override || status_line_active {
@@ -4671,7 +4695,7 @@ impl ChatComposer {
                                 // the context indicator on narrow widths.
                                 Some(single_line_footer_layout(
                                     hint_rect,
-                                    right_width,
+                                    reserved_right_width,
                                     left_mode_indicator,
                                     show_cycle_hint,
                                     show_shortcuts_hint,
@@ -4755,8 +4779,27 @@ impl ChatComposer {
                             show_queue_hint,
                         );
                     }
+                    let right_content_rect = Rect::new(
+                        hint_rect.x,
+                        hint_rect.y,
+                        hint_rect.width.saturating_sub(exit_reserve),
+                        hint_rect.height,
+                    );
                     if show_right && let Some(line) = &right_line {
-                        render_context_right(hint_rect, buf, line);
+                        render_context_right(right_content_rect, buf, line);
+                    }
+                    if exit_reserve > 0 {
+                        let exit_rect = Rect::new(
+                            hint_rect.right().saturating_sub(EXIT_LINK_WIDTH),
+                            hint_rect.y + hint_rect.height.saturating_sub(1),
+                            EXIT_LINK_WIDTH,
+                            1,
+                        );
+                        Span::from(EXIT_LINK_LABEL)
+                            .cyan()
+                            .underlined()
+                            .render(exit_rect, buf);
+                        self.exit_link_rect.set(Some(exit_rect));
                     }
                     if status_line_active
                         && let Some(url) = self.footer.status_line_hyperlink_url.as_deref()
@@ -5183,10 +5226,63 @@ mod tests {
     }
 
     #[test]
+    fn exit_link_hitbox_matches_the_rendered_footer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for task_running in [false, true] {
+            let (tx, _rx) = unbounded_channel::<AppEvent>();
+            let sender = AppEventSender::new(tx);
+            let mut composer = ChatComposer::new(
+                /*has_input_focus*/ true,
+                sender,
+                /*enhanced_keys_supported*/ true,
+                "Ask Codex to do anything".to_string(),
+                /*disable_paste_burst*/ false,
+            );
+            composer.set_task_running(task_running);
+            if task_running {
+                type_chars_humanlike(&mut composer, &['q']);
+            }
+            let footer_props = composer.footer_props();
+            let footer_lines = footer_height(&footer_props);
+            let height = footer_lines + ChatComposer::footer_spacing(footer_lines) + 8;
+            let mut terminal = Terminal::new(TestBackend::new(/*width*/ 100, height)).unwrap();
+            terminal
+                .draw(|frame| composer.render(frame.area(), frame.buffer_mut()))
+                .unwrap();
+
+            let expected = Rect::new(
+                /*x*/ 96,
+                height - 1,
+                /*width*/ 4,
+                /*height*/ 1,
+            );
+            assert_eq!(composer.exit_link_rect.get(), Some(expected));
+            assert!(composer.exit_link_contains(expected.x, expected.y));
+        }
+    }
+
+    #[test]
     fn footer_mode_snapshots() {
         use crossterm::event::KeyCode;
         use crossterm::event::KeyEvent;
         use crossterm::event::KeyModifiers;
+
+        snapshot_composer_state(
+            "footer_mode_idle_exit_link",
+            /*enhanced_keys_supported*/ true,
+            |_| {},
+        );
+
+        snapshot_composer_state(
+            "footer_mode_task_running_exit_link",
+            /*enhanced_keys_supported*/ true,
+            |composer| {
+                composer.set_task_running(/*running*/ true);
+                type_chars_humanlike(composer, &['q']);
+            },
+        );
 
         snapshot_composer_state(
             "footer_mode_shortcut_overlay",
