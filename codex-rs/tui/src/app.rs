@@ -1191,11 +1191,17 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(debug_assertions)]
         let pre_loop_exit_reason: Option<ExitReason> = None;
 
+        let mut terminal_lifecycle_shutdown =
+            Box::pin(crate::terminal_lifecycle::wait_for_shutdown());
         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
             Ok(exit_reason)
         } else {
             loop {
                 let control = select! {
+                    _ = &mut terminal_lifecycle_shutdown => {
+                        tracing::warn!("terminal lifecycle ended; shutting down active thread");
+                        app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
+                    }
                     Some(event) = app_event_rx.recv() => {
                         match Box::pin(app.handle_event(tui, &mut app_server, event)).await {
                             Ok(control) => control,
@@ -1298,9 +1304,21 @@ See the Codex keymap documentation for supported actions and examples."
         event: TuiEvent,
     ) -> Result<AppRunControl> {
         let screen_size = tui.screen_size_for_event(&event)?;
-        if !matches!(&event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
+        if !matches!(
+            &event,
+            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::MousePress { .. }
+        ) {
             self.expire_pending_key_chord();
             self.handle_draw_pre_render(tui, screen_size)?;
+        }
+
+        if let TuiEvent::MousePress { column, row } = event {
+            if self.chat_widget.exit_link_contains(column, row) {
+                return Ok(self
+                    .handle_exit_mode(app_server, ExitMode::ShutdownFirst)
+                    .await);
+            }
+            return Ok(AppRunControl::Continue);
         }
 
         let event = if let TuiEvent::Key(key_event) = event {
@@ -1329,6 +1347,7 @@ See the Codex keymap documentation for supported actions and examples."
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
+                TuiEvent::MousePress { .. } => {}
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                     if self.backtrack_render_pending {
                         self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;

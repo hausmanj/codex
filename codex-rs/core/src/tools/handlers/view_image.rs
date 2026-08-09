@@ -1,9 +1,7 @@
 use codex_protocol::items::ImageViewItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
-use codex_protocol::models::FunctionCallOutputBody;
-use codex_protocol::models::FunctionCallOutputContentItem;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
@@ -218,20 +216,18 @@ impl ToolOutput for ViewImageOutput {
         true
     }
 
-    fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
-        let body =
-            FunctionCallOutputBody::ContentItems(vec![FunctionCallOutputContentItem::InputImage {
+    fn to_response_item(&self, _call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
+        // LM Studio compatibility path:
+        // Send viewed images through the same Responses message/input_image shape
+        // used by normal image input instead of nesting the image inside
+        // function_call_output.output.
+        ResponseInputItem::Message {
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
                 image_url: self.image_url.clone(),
                 detail: Some(self.image_detail),
-            }]);
-        let output = FunctionCallOutputPayload {
-            body,
-            success: Some(true),
-        };
-
-        ResponseInputItem::FunctionCallOutput {
-            call_id: call_id.to_string(),
-            output,
+            }],
+            phase: None,
         }
     }
 

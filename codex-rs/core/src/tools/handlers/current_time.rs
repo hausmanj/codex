@@ -8,6 +8,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_features::CurrentTimeReminderDeliveryMode;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiNamespace;
@@ -99,7 +100,10 @@ impl ToolExecutor<ToolInvocation> for CurrentTimeHandler {
                     FunctionCallError::Fatal(format!("failed to read current time: {err:#}"))
                 })?;
             Ok(boxed_tool_output(CurrentTimeOutput(
-                CurrentTimeReminder::new(current_time),
+                CurrentTimeReminder::new(
+                    current_time,
+                    CurrentTimeReminderDeliveryMode::AnyInference,
+                ),
             )))
         })
     }

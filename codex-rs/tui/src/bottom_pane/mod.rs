@@ -1357,6 +1357,10 @@ impl BottomPane {
         self.composer.is_empty()
     }
 
+    pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
+        self.view_stack.is_empty() && self.composer.exit_link_contains(column, row)
+    }
+
     #[cfg(test)]
     pub(crate) fn composer_is_vim_enabled(&self) -> bool {
         self.composer.is_vim_enabled()
