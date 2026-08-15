@@ -60,6 +60,20 @@ In the codex-rs folder where the rust code lives:
   - Avoid adding new standalone methods to `codex-rs/tui/src/chatwidget.rs` unless the change is
     trivial; prefer new modules/files and keep `chatwidget.rs` focused on orchestration.
 - When running Rust commands (e.g. `just fix` or `just test`) be patient with the command and never try to kill them using the PID. Rust lock can make the execution slow, this is expected.
+- Local Codex build/install note from 2026-08-15: after committing
+  `7b6e278ff Honor configured context token limit`, `cargo build --release -p
+  codex-cli` took 13m33s and produced
+  `codex-rs/target/release/codex` (`codex-cli 0.147.1`). The normal shell
+  command now resolves through
+  `/Users/johnhausman/.local/bin/codex ->
+  /Users/johnhausman/source/codex/codex-rs/target/release/codex`. When asked
+  whether a local Codex source change is effective, verify all three separately:
+  the build artifact runs, `codex` on PATH points to that artifact, and any
+  already-running Codex interface has been restarted. Existing sessions keep
+  using their original executable; for example the old interface process was
+  still loaded from
+  `/Users/johnhausman/.codex/packages/standalone/releases/0.147.0-aarch64-apple-darwin/bin/codex`
+  until restarted, even though new `codex` launches used the rebuilt binary.
 
 Run `just fmt` (in the `codex-rs` directory) automatically after you have finished making code changes anywhere in this repository; do not ask for approval to run it. Additionally, run the tests:
 
