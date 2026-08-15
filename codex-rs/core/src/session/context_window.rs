@@ -35,7 +35,10 @@ pub(crate) async fn context_window_token_status(
             // larger than the window itself and never compact until the hard cap.
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
-                turn_context.model_info.auto_compact_token_limit(),
+                turn_context
+                    .config
+                    .model_auto_compact_token_limit
+                    .or_else(|| turn_context.model_info.auto_compact_token_limit()),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {
