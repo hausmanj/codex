@@ -304,6 +304,7 @@ impl StartupDraftPump {
                     return Ok(());
                 }
                 TuiEvent::Paste(text) => !text.is_empty(),
+                TuiEvent::MousePress { .. } => false,
                 TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume => {
                     self.pending_paste_newline = Some((started_at, newlines));
                     if self.initial_screen == StartupDraftInitialScreen::Composer {
@@ -359,6 +360,7 @@ impl StartupDraftPump {
                 }
             }
             TuiEvent::Draw | TuiEvent::Resize(_) | TuiEvent::Resume => {}
+            TuiEvent::MousePress { .. } => {}
         }
         if self.initial_screen == StartupDraftInitialScreen::Composer {
             self.draw(tui, screen_size)?;
