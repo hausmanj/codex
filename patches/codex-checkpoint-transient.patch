@@ -1,0 +1,79 @@
+diff --git a/codex-rs/core/src/session/time_reminder.rs b/codex-rs/core/src/session/time_reminder.rs
+index 30c4f4e..7d49469 100644
+--- a/codex-rs/core/src/session/time_reminder.rs
++++ b/codex-rs/core/src/session/time_reminder.rs
+@@ -72,9 +72,9 @@ pub(super) async fn maybe_record_current_time_reminder(
+     sess: &Session,
+     turn_context: &TurnContext,
+     window_id: &str,
+-) -> CodexResult<()> {
++) -> CodexResult<Option<ResponseItem>> {
+     let Some(config) = turn_context.config.current_time_reminder else {
+-        return Ok(());
++        return Ok(None);
+     };
+ 
+     let current_time = sess
+@@ -94,15 +94,19 @@ pub(super) async fn maybe_record_current_time_reminder(
+         )
+     };
+     if !reminder_is_due {
+-        return Ok(());
++        return Ok(None);
+     }
+ 
+     let response_item = ContextualUserFragment::into(crate::context::CurrentTimeReminder::new(
+         current_time,
+         config.delivery_mode,
+     ));
++    if config.delivery_mode == CurrentTimeReminderDeliveryMode::CheckpointMemory {
++        return Ok(Some(response_item));
++    }
++
+     sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+         .await;
+ 
+-    Ok(())
++    Ok(None)
+ }
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 96ff9cf..46d0f4e 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -320,25 +320,29 @@ pub(crate) async fn run_turn(
+             }
+         };
+         let sampling_request_result: CodexResult<_> = async {
+-            super::time_reminder::maybe_record_current_time_reminder(
+-                sess.as_ref(),
+-                turn_context.as_ref(),
+-                &window_id,
+-            )
+-            .await?;
++            let transient_current_time_reminder =
++                super::time_reminder::maybe_record_current_time_reminder(
++                    sess.as_ref(),
++                    turn_context.as_ref(),
++                    &window_id,
++                )
++                .await?;
+ 
+             world_state = sess
+                 .record_step_world_state_if_changed(&world_state, step_context.as_ref())
+                 .await?;
+ 
+             // Construct the input that we will send to the model.
+-            let sampling_request_input: Vec<ResponseItem> = async {
++            let mut sampling_request_input: Vec<ResponseItem> = async {
+                 sess.clone_history()
+                     .await
+                     .for_prompt(&turn_context.model_info.input_modalities)
+             }
+             .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
+             .await;
++            if let Some(reminder) = transient_current_time_reminder {
++                sampling_request_input.push(reminder);
++            }
+ 
+             let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+                 sess.installation_id.clone(),
