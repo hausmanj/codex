@@ -1,0 +1,457 @@
+diff --git a/codex-rs/core/src/context/current_time_reminder.rs b/codex-rs/core/src/context/current_time_reminder.rs
+index 0baf56b..256065c 100644
+--- a/codex-rs/core/src/context/current_time_reminder.rs
++++ b/codex-rs/core/src/context/current_time_reminder.rs
+@@ -1,15 +1,23 @@
+ use chrono::DateTime;
+ use chrono::Utc;
++use codex_features::CurrentTimeReminderDeliveryMode;
+ 
+ use super::ContextualUserFragment;
+ 
+ pub(crate) struct CurrentTimeReminder {
+     current_time: DateTime<Utc>,
++    delivery_mode: CurrentTimeReminderDeliveryMode,
+ }
+ 
+ impl CurrentTimeReminder {
+-    pub(crate) fn new(current_time: DateTime<Utc>) -> Self {
+-        Self { current_time }
++    pub(crate) fn new(
++        current_time: DateTime<Utc>,
++        delivery_mode: CurrentTimeReminderDeliveryMode,
++    ) -> Self {
++        Self {
++            current_time,
++            delivery_mode,
++        }
+     }
+ 
+     pub(crate) fn formatted_time(&self) -> String {
+@@ -33,6 +41,27 @@ impl ContextualUserFragment for CurrentTimeReminder {
+     }
+ 
+     fn body(&self) -> String {
+-        format!("It is {}.", self.formatted_time())
++        match self.delivery_mode {
++            CurrentTimeReminderDeliveryMode::CheckpointMemory => format!(
++                concat!(
++                    "It is {}. Before continuing the current task, update the local Codex/Qwen ",
++                    "session checkpoint file at exactly `.qwen/codex/SESSION_MEMORY.md`. ",
++                    "Do not use `.codex/SESSION_MEMORY.md`. The file must contain a `Rolling Summary` ",
++                    "followed by at most the newest 10 detailed checkpoints. Append one new checkpoint ",
++                    "of approximately 150-300 tokens recording: timestamp, current objective, progress ",
++                    "since the previous checkpoint, files touched, commands/tests run, decisions, blockers, ",
++                    "and the exact next action. If appending would create checkpoint 11, first merge any ",
++                    "still-useful information from the oldest detailed checkpoint into `Rolling Summary`, ",
++                    "then delete that oldest detailed checkpoint so exactly the newest 10 remain. Preserve ",
++                    "existing useful summary information. After the file update, immediately resume the exact ",
++                    "task that was in progress; do not stop merely because the checkpoint was written."
++                ),
++                self.formatted_time()
++            ),
++            CurrentTimeReminderDeliveryMode::AnyInference
++            | CurrentTimeReminderDeliveryMode::AfterUserOrToolOutput => {
++                format!("It is {}.", self.formatted_time())
++            }
++        }
+     }
+ }
+diff --git a/codex-rs/core/src/session/time_reminder.rs b/codex-rs/core/src/session/time_reminder.rs
+index 398ae58..30c4f4e 100644
+--- a/codex-rs/core/src/session/time_reminder.rs
++++ b/codex-rs/core/src/session/time_reminder.rs
+@@ -97,8 +97,10 @@ pub(super) async fn maybe_record_current_time_reminder(
+         return Ok(());
+     }
+ 
+-    let response_item =
+-        ContextualUserFragment::into(crate::context::CurrentTimeReminder::new(current_time));
++    let response_item = ContextualUserFragment::into(crate::context::CurrentTimeReminder::new(
++        current_time,
++        config.delivery_mode,
++    ));
+     sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+         .await;
+ 
+diff --git a/codex-rs/features/src/feature_configs.rs b/codex-rs/features/src/feature_configs.rs
+index 0f3e9be..b56bcc5 100644
+--- a/codex-rs/features/src/feature_configs.rs
++++ b/codex-rs/features/src/feature_configs.rs
+@@ -221,6 +221,8 @@ pub enum CurrentTimeReminderDeliveryMode {
+     AnyInference,
+     /// Allow reminders after user input or tool output; new context windows still force one.
+     AfterUserOrToolOutput,
++    /// Deliver a local-Qwen rolling session-memory checkpoint instruction when the interval is due.
++    CheckpointMemory,
+ }
+ 
+ #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 1b3e6f2..c44fe42 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -737,6 +737,37 @@ fn active_turn_interrupt_race(error: &TypedRequestError) -> Option<String> {
+     )
+ }
+ 
++#[cfg(unix)]
++async fn wait_for_terminal_lifecycle_shutdown() {
++    use tokio::signal::unix::SignalKind;
++    use tokio::signal::unix::signal;
++    use tokio::time::Duration;
++
++    let mut sighup = signal(SignalKind::hangup()).ok();
++    let mut parent_check = tokio::time::interval(Duration::from_secs(1));
++    loop {
++        tokio::select! {
++            _ = async {
++                match sighup.as_mut() {
++                    Some(stream) => { let _ = stream.recv().await; }
++                    None => std::future::pending::<()>().await,
++                }
++            } => return,
++            _ = parent_check.tick() => {
++                // SAFETY: getppid has no preconditions and does not dereference pointers.
++                if unsafe { libc::getppid() } == 1 {
++                    return;
++                }
++            }
++        }
++    }
++}
++
++#[cfg(not(unix))]
++async fn wait_for_terminal_lifecycle_shutdown() {
++    std::future::pending::<()>().await;
++}
++
+ impl App {
+     pub fn chatwidget_init_for_forked_or_resumed_thread(
+         &self,
+@@ -1191,11 +1222,16 @@ See the Codex keymap documentation for supported actions and examples."
+         #[cfg(debug_assertions)]
+         let pre_loop_exit_reason: Option<ExitReason> = None;
+ 
++        let mut terminal_lifecycle_shutdown = Box::pin(wait_for_terminal_lifecycle_shutdown());
+         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
+             Ok(exit_reason)
+         } else {
+             loop {
+                 let control = select! {
++                    _ = &mut terminal_lifecycle_shutdown => {
++                        tracing::warn!("terminal lifecycle ended; shutting down active thread");
++                        app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
++                    }
+                     Some(event) = app_event_rx.recv() => {
+                         match Box::pin(app.handle_event(tui, &mut app_server, event)).await {
+                             Ok(control) => control,
+@@ -1298,7 +1334,10 @@ See the Codex keymap documentation for supported actions and examples."
+         event: TuiEvent,
+     ) -> Result<AppRunControl> {
+         let screen_size = tui.screen_size_for_event(&event)?;
+-        if !matches!(&event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
++        if !matches!(
++            &event,
++            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::MousePress { .. }
++        ) {
+             self.expire_pending_key_chord();
+             self.handle_draw_pre_render(tui, screen_size)?;
+         }
+@@ -1321,6 +1360,13 @@ See the Codex keymap documentation for supported actions and examples."
+                 TuiEvent::Key(key_event) => {
+                     self.handle_key_event(tui, app_server, key_event).await;
+                 }
++                TuiEvent::MousePress { column, row } => {
++                    if self.chat_widget.exit_link_contains(column, row) {
++                        return Ok(self
++                            .handle_exit_mode(app_server, ExitMode::ShutdownFirst)
++                            .await);
++                    }
++                }
+                 TuiEvent::Paste(pasted) => {
+                     // Many terminals convert newlines to \r when pasting (e.g., iTerm2),
+                     // but tui-textarea expects \n. Normalize CR to LF.
+diff --git a/codex-rs/tui/src/bottom_pane/chat_composer.rs b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+index 9574b61..134f6e9 100644
+--- a/codex-rs/tui/src/bottom_pane/chat_composer.rs
++++ b/codex-rs/tui/src/bottom_pane/chat_composer.rs
+@@ -304,6 +304,7 @@ use codex_file_search::FileMatch;
+ #[cfg(test)]
+ use codex_plugin::AppConnectorId;
+ use codex_plugin::PluginCapabilitySummary;
++use std::cell::Cell;
+ use std::cell::OnceCell;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+@@ -501,6 +502,7 @@ pub(crate) struct ChatComposer {
+     history_search_next_keys: Vec<KeyBinding>,
+     editor_keymap: EditorKeymap,
+     vim_normal_keymap: VimNormalKeymap,
++    exit_link_rect: Cell<Option<Rect>>,
+ }
+ 
+ /// A resolved legacy `$` target plus any catalog built while disambiguating shell syntax.
+@@ -532,6 +534,9 @@ pub(crate) struct ComposerDraftSnapshot {
+ }
+ 
+ const FOOTER_SPACING_HEIGHT: u16 = 0;
++const EXIT_LINK_LABEL: &str = "exit";
++const EXIT_LINK_WIDTH: u16 = 4;
++const EXIT_LINK_GAP: u16 = 2;
+ 
+ /// Builds the one-line nudge that replaces the ambient footer without adding layout height.
+ fn plan_mode_nudge_line() -> Line<'static> {
+@@ -687,6 +692,7 @@ impl ChatComposer {
+             history_search_next_keys: default_keymap.composer.history_search_next.clone(),
+             editor_keymap: default_editor_keymap,
+             vim_normal_keymap: default_vim_normal_keymap,
++            exit_link_rect: Cell::new(None),
+         };
+         // Apply configuration via the setter to keep side-effects centralized.
+         this.set_disable_paste_burst(disable_paste_burst);
+@@ -4458,6 +4464,12 @@ impl ChatComposer {
+ }
+ 
+ impl ChatComposer {
++    pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
++        self.exit_link_rect.get().is_some_and(|rect| {
++            column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
++        })
++    }
++
+     pub(crate) fn render_with_mask(&self, area: Rect, buf: &mut Buffer, mask_char: Option<char>) {
+         self.render_with_mask_and_textarea_right_reserve(
+             area, buf, mask_char, /*textarea_right_reserve*/ 0,
+@@ -4471,6 +4483,7 @@ impl ChatComposer {
+         mask_char: Option<char>,
+         textarea_right_reserve: u16,
+     ) {
++        self.exit_link_rect.set(None);
+         let [composer_rect, remote_images_rect, textarea_rect, popup_rect] =
+             self.layout_areas_with_textarea_right_reserve(area, textarea_right_reserve);
+         match &self.popups.active {
+@@ -4616,8 +4629,15 @@ impl ChatComposer {
+                             Some(self.right_footer_line_with_context())
+                         };
+                     let right_width = right_line.as_ref().map(|l| l.width() as u16).unwrap_or(0);
++                    let exit_reserve = if hint_rect.width >= EXIT_LINK_WIDTH {
++                        EXIT_LINK_WIDTH.saturating_add(EXIT_LINK_GAP)
++                    } else {
++                        0
++                    };
++                    let reserved_right_width = right_width.saturating_add(exit_reserve);
+                     if status_line_active
+-                        && let Some(max_left) = max_left_width_for_right(hint_rect, right_width)
++                        && let Some(max_left) =
++                            max_left_width_for_right(hint_rect, reserved_right_width)
+                         && left_width > max_left
+                         && let Some(line) = combined_status_line.as_ref().map(|line| {
+                             truncate_line_with_ellipsis_if_overflow(line.clone(), max_left as usize)
+@@ -4627,7 +4647,7 @@ impl ChatComposer {
+                         truncated_status_line = Some(line);
+                     }
+                     let can_show_left_and_context =
+-                        can_show_left_with_context(hint_rect, left_width, right_width);
++                        can_show_left_with_context(hint_rect, left_width, reserved_right_width);
+                     let has_override =
+                         self.footer.flash_visible() || active_footer_hint_override.is_some();
+                     let single_line_layout = if has_override || status_line_active {
+@@ -4641,7 +4661,7 @@ impl ChatComposer {
+                                 // the context indicator on narrow widths.
+                                 Some(single_line_footer_layout(
+                                     hint_rect,
+-                                    right_width,
++                                    reserved_right_width,
+                                     left_mode_indicator,
+                                     show_cycle_hint,
+                                     show_shortcuts_hint,
+@@ -4725,8 +4745,24 @@ impl ChatComposer {
+                             show_queue_hint,
+                         );
+                     }
++                    let right_content_rect = Rect::new(
++                        hint_rect.x,
++                        hint_rect.y,
++                        hint_rect.width.saturating_sub(exit_reserve),
++                        hint_rect.height,
++                    );
+                     if show_right && let Some(line) = &right_line {
+-                        render_context_right(hint_rect, buf, line);
++                        render_context_right(right_content_rect, buf, line);
++                    }
++                    if hint_rect.width >= EXIT_LINK_WIDTH {
++                        let exit_rect = Rect::new(
++                            hint_rect.right().saturating_sub(EXIT_LINK_WIDTH),
++                            hint_rect.y + hint_rect.height.saturating_sub(1),
++                            EXIT_LINK_WIDTH,
++                            1,
++                        );
++                        Span::from(EXIT_LINK_LABEL).cyan().underlined().render(exit_rect, buf);
++                        self.exit_link_rect.set(Some(exit_rect));
+                     }
+                     if status_line_active
+                         && let Some(url) = self.footer.status_line_hyperlink_url.as_deref()
+diff --git a/codex-rs/tui/src/bottom_pane/mod.rs b/codex-rs/tui/src/bottom_pane/mod.rs
+index 527e510..b31e8a6 100644
+--- a/codex-rs/tui/src/bottom_pane/mod.rs
++++ b/codex-rs/tui/src/bottom_pane/mod.rs
+@@ -1353,6 +1353,10 @@ impl BottomPane {
+         }
+     }
+ 
++    pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
++        self.view_stack.is_empty() && self.composer.exit_link_contains(column, row)
++    }
++
+     pub(crate) fn composer_is_empty(&self) -> bool {
+         self.composer.is_empty()
+     }
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index bb1d3aa..ad77f30 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -1355,6 +1355,10 @@ impl ChatWidget {
+             .send(AppEvent::Exit(ExitMode::ShutdownFirst));
+     }
+ 
++    pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
++        self.bottom_pane.exit_link_contains(column, row)
++    }
++
+     pub(crate) fn show_shutdown_in_progress(&mut self) {
+         self.bottom_pane.show_shutdown_in_progress();
+     }
+diff --git a/codex-rs/tui/src/tui.rs b/codex-rs/tui/src/tui.rs
+index 6b06113..caf9b90 100644
+--- a/codex-rs/tui/src/tui.rs
++++ b/codex-rs/tui/src/tui.rs
+@@ -218,6 +218,10 @@ pub fn set_modes() -> Result<()> {
+     ensure_virtual_terminal_processing()?;
+ 
+     execute!(stdout(), EnableBracketedPaste)?;
++    // X10/DECSET 9 reports button presses only. Unlike global mouse capture, it does not
++    // request wheel-motion reporting, preserving the terminal's native scrollback behavior.
++    #[cfg(unix)]
++    execute!(stdout(), EnablePressOnlyMouse)?;
+ 
+     enable_raw_mode()?;
+     #[cfg(windows)]
+@@ -237,6 +241,48 @@ pub fn set_modes() -> Result<()> {
+     Ok(())
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct EnablePressOnlyMouse;
++
++impl Command for EnablePressOnlyMouse {
++    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
++        write!(f, "\x1b[?9h")
++    }
++
++    #[cfg(windows)]
++    fn execute_winapi(&self) -> Result<()> {
++        Err(std::io::Error::other(
++            "tried to execute X10 press-only mouse mode using WinAPI; use ANSI instead",
++        ))
++    }
++
++    #[cfg(windows)]
++    fn is_ansi_code_supported(&self) -> bool {
++        true
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct DisablePressOnlyMouse;
++
++impl Command for DisablePressOnlyMouse {
++    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
++        write!(f, "\x1b[?9l")
++    }
++
++    #[cfg(windows)]
++    fn execute_winapi(&self) -> Result<()> {
++        Err(std::io::Error::other(
++            "tried to disable X10 press-only mouse mode using WinAPI; use ANSI instead",
++        ))
++    }
++
++    #[cfg(windows)]
++    fn is_ansi_code_supported(&self) -> bool {
++        true
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ struct EnableAlternateScroll;
+ 
+@@ -302,6 +348,10 @@ fn restore_common(
+         KeyboardRestore::ResetAfterExit => keyboard_modes::reset_keyboard_reporting_after_exit(),
+     }
+ 
++    #[cfg(unix)]
++    if let Err(err) = execute!(stdout(), DisablePressOnlyMouse) {
++        first_error.get_or_insert(err);
++    }
+     if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
+         first_error.get_or_insert(err);
+     }
+@@ -551,6 +601,8 @@ pub enum TuiEvent {
+     Key(KeyEvent),
+     /// A bracketed paste payload normalized by the app layer before it reaches the composer.
+     Paste(String),
++    /// A left-button press reported by X10 mouse mode. Wheel motion is intentionally never mapped.
++    MousePress { column: u16, row: u16 },
+     /// A terminal size notification and its reported dimensions.
+     ///
+     /// Resize is separate from `Draw` so the app can run feature-gated pre-render logic without
+diff --git a/codex-rs/tui/src/tui/event_stream.rs b/codex-rs/tui/src/tui/event_stream.rs
+index da972c8..79f158a 100644
+--- a/codex-rs/tui/src/tui/event_stream.rs
++++ b/codex-rs/tui/src/tui/event_stream.rs
+@@ -26,6 +26,8 @@ use std::task::Context;
+ use std::task::Poll;
+ 
+ use crossterm::event::Event;
++use crossterm::event::MouseButton;
++use crossterm::event::MouseEventKind;
+ use tokio::sync::broadcast;
+ use tokio::sync::watch;
+ use tokio_stream::Stream;
+@@ -271,6 +273,14 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
+                 Some(TuiEvent::Resize(ratatui::layout::Size { width, height }))
+             }
+             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
++            Event::Mouse(mouse)
++                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
++            {
++                Some(TuiEvent::MousePress {
++                    column: mouse.column,
++                    row: mouse.row,
++                })
++            }
+             Event::FocusGained => {
+                 self.terminal_focused.store(true, Ordering::Relaxed);
+                 // Keep the startup-cached palette: querying terminal colors here blocks the
+diff --git a/codex-rs/tui/src/tui/screen_size.rs b/codex-rs/tui/src/tui/screen_size.rs
+index c08709c..3c4e5ab 100644
+--- a/codex-rs/tui/src/tui/screen_size.rs
++++ b/codex-rs/tui/src/tui/screen_size.rs
+@@ -45,10 +45,14 @@ impl Tui {
+                 self.terminal.size()?
+             }
+             TuiEvent::Draw => self.screen_size.deferred_size.take().unwrap_or(cached),
+-            TuiEvent::Key(_) | TuiEvent::Paste(_) => cached,
++            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::MousePress { .. } => cached,
+         };
+         self.screen_size.pending_draw_size =
+-            (!matches!(event, TuiEvent::Key(_) | TuiEvent::Paste(_))).then_some(size);
++            (!matches!(
++                event,
++                TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::MousePress { .. }
++            ))
++            .then_some(size);
+         Ok(size)
+     }
+ 
