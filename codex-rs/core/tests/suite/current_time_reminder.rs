@@ -381,22 +381,44 @@ async fn checkpoint_memory_reminder_targets_the_qwen_memory_file() -> Result<()>
     test.submit_turn("keep working").await?;
 
     let reminders = current_time_reminders(&responses.single_request());
+    for expected in [
+        "DURABLE PROJECT STATE:",
+        "QWEN ROLLING CHECKPOINT:",
+        "$HOME/.qwen/projects/<encoded-project-root>/codex/SESSION_MEMORY.md",
+        "Never create a repo-local `.qwen/codex/SESSION_MEMORY.md`",
+        "Do NOT write routine rolling checkpoints into that file",
+        "last completed item",
+        "next unresolved item",
+        "Blockers: None",
+        "immediately continue",
+    ] {
+        assert!(
+            reminders.iter().any(|reminder| reminder.contains(expected)),
+            "missing checkpoint instruction: {expected}"
+        );
+    }
+
     assert_eq!(reminders.len(), 1);
     let reminder = &reminders[0];
     for expected in [
-        ".qwen/codex/SESSION_MEMORY.md",
+        "$HOME/.qwen/projects/<encoded-project-root>/codex/SESSION_MEMORY.md",
         "Rolling Summary",
-        "newest 10 detailed checkpoints",
-        "checkpoint 11",
-        "exact next action",
+        "Resume State",
+        "Known Environment",
+        "Recent Checkpoints",
+        "last completed item",
+        "next unresolved item",
+        "Blockers: None",
+        "Do not repeat mount discovery",
+        "Do not guess",
+        "newest 10",
+        "immediately resume",
     ] {
         assert!(
             reminder.contains(expected),
             "checkpoint instruction should contain {expected:?}: {reminder:?}"
         );
     }
-    assert!(!reminder.contains(".codex/SESSION_MEMORY.md"));
-
     Ok(())
 }
 
