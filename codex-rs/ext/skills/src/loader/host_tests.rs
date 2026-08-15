@@ -7,6 +7,7 @@ use codex_protocol::protocol::SkillScope;
 use codex_skills::SkillDependencies;
 use codex_skills::SkillInterface;
 use codex_skills::SkillMetadata;
+use codex_skills::SkillModel;
 use codex_skills::SkillPolicy;
 use codex_skills::SkillToolDependency;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -107,7 +108,7 @@ async fn loads_host_frontmatter_dependencies_and_policy() {
     let skill_path = write_skill(
         &root,
         "demo",
-        "name: demo\ndescription: Demo skill\nmetadata:\n  short-description: Short demo",
+        "name: demo\ndescription: Demo skill\nmodel: luna\nmetadata:\n  short-description: Short demo",
     );
     write_metadata(
         &root,
@@ -117,9 +118,11 @@ async fn loads_host_frontmatter_dependencies_and_policy() {
     - type: mcp
       value: demo-tool
       description: Demo tool
+      oauth:
+        callbackPort: 3118
 policy:
   allow_implicit_invocation: false
-  products: [codex]
+  products: [codex, CHATGPT, atlas]
 "##,
     );
 
@@ -132,6 +135,7 @@ policy:
             name: "demo".to_string(),
             description: "Demo skill".to_string(),
             short_description: Some("Short demo".to_string()),
+            model: Some(SkillModel::Luna),
             interface: None,
             dependencies: Some(SkillDependencies {
                 tools: vec![SkillToolDependency {
@@ -141,11 +145,12 @@ policy:
                     transport: None,
                     command: None,
                     url: None,
+                    oauth_callback_port: Some(3118),
                 }],
             }),
             policy: Some(SkillPolicy {
                 allow_implicit_invocation: Some(false),
-                products: vec![Product::Codex],
+                products: vec![Product::Codex, Product::Chatgpt, Product::Atlas],
             }),
             path_to_skills_md: skill_path,
             scope: SkillScope::User,
@@ -170,6 +175,7 @@ async fn invalid_optional_metadata_fails_open() {
             name: "demo".to_string(),
             description: "Demo skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
@@ -209,6 +215,7 @@ async fn loads_host_interface_metadata_and_local_asset_paths() {
             name: "demo".to_string(),
             description: "Demo skill".to_string(),
             short_description: None,
+            model: None,
             interface: Some(SkillInterface {
                 display_name: Some("Demo".to_string()),
                 short_description: Some("Interface summary".to_string()),
@@ -248,6 +255,7 @@ async fn loads_plugin_skill_interface_icons_from_local_and_shared_assets() {
             name: "plugin:send-message".to_string(),
             description: "Send messages".to_string(),
             short_description: None,
+            model: None,
             interface: Some(SkillInterface {
                 display_name: None,
                 short_description: None,
@@ -290,6 +298,7 @@ async fn rejects_plugin_skill_interface_icons_outside_shared_assets() {
             name: "plugin:send-message".to_string(),
             description: "Send messages".to_string(),
             short_description: None,
+            model: None,
             interface: Some(SkillInterface {
                 display_name: Some("Send Message".to_string()),
                 short_description: None,
@@ -327,6 +336,7 @@ async fn rejects_interface_fields_that_escape_or_fail_validation() {
             name: "demo".to_string(),
             description: "Demo skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
@@ -377,6 +387,7 @@ async fn discovers_nested_plugin_namespace_without_plugin_identity() {
             name: "plugin-name:demo".to_string(),
             description: "Demo skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
@@ -422,6 +433,7 @@ async fn plugin_root_accepts_maximum_length_qualified_skill_name() {
             name: format!("{plugin_namespace}:{skill_name}"),
             description: "Search skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
@@ -430,6 +442,41 @@ async fn plugin_root_accepts_maximum_length_qualified_skill_name() {
             plugin_id: Some("demo@test".to_string()),
             remote_plugin_id: None,
         }]
+    );
+}
+
+#[tokio::test]
+async fn plugin_root_rejects_overlong_qualified_skill_name() {
+    let root = TempDir::new().expect("temp dir");
+    let skill_name = "s".repeat(MAX_NAME_LEN);
+    write_skill(
+        &root,
+        "skills/search",
+        &format!("name: {skill_name}\ndescription: Search skill"),
+    );
+    let plugin_root = AbsolutePathBuf::from_absolute_path(root.path()).expect("plugin root");
+
+    let snapshot = load_host_skill_root(HostSkillRoot::plugin(
+        PluginSkillRoot {
+            path: plugin_root.join("skills"),
+            plugin_identity: PluginIdentity {
+                plugin_id: "demo@test".to_string(),
+                remote_plugin_id: None,
+            },
+            plugin_namespace: "p".repeat(MAX_NAME_LEN + 1),
+            plugin_root,
+            discovery_mode: SkillDiscoveryMode::Recursive,
+        },
+        Arc::clone(&LOCAL_FS),
+    ))
+    .await;
+
+    assert_eq!(snapshot.skills, Vec::new());
+    assert_eq!(snapshot.errors.len(), 1);
+    assert!(
+        snapshot.errors[0]
+            .message
+            .contains("invalid qualified name")
     );
 }
 
@@ -481,6 +528,7 @@ async fn recursive_plugin_root_preserves_owner_namespace_and_shared_asset_policy
             name: "plugin:demo".to_string(),
             description: "Demo skill".to_string(),
             short_description: None,
+            model: None,
             interface: Some(SkillInterface {
                 display_name: None,
                 short_description: None,
@@ -540,6 +588,7 @@ async fn direct_child_plugin_root_ignores_nested_skills() {
             name: "plugin:direct".to_string(),
             description: "Direct skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
@@ -621,6 +670,7 @@ async fn recursive_plugin_root_preserves_symlinked_skill_discovery_path() {
             name: "plugin:demo".to_string(),
             description: "Symlinked skill".to_string(),
             short_description: None,
+            model: None,
             interface: None,
             dependencies: None,
             policy: None,
@@ -638,7 +688,7 @@ async fn recursive_plugin_root_preserves_symlinked_skill_discovery_path() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn follows_directory_symlinks_for_user_but_not_system_scope() {
+async fn follows_directory_symlinks_except_for_system_scope() {
     use std::os::unix::fs::symlink;
 
     let root = TempDir::new().expect("temp dir");
@@ -646,18 +696,25 @@ async fn follows_directory_symlinks_for_user_but_not_system_scope() {
     let target_skill = write_skill(&target, "demo", "name: demo\ndescription: Symlinked skill");
     symlink(target.path().join("demo"), root.path().join("alias")).expect("create symlink");
 
-    let user_snapshot = load_host_skill_root(root_for(&root, SkillScope::User)).await;
-    let system_snapshot = load_host_skill_root(root_for(&root, SkillScope::System)).await;
+    for scope in [SkillScope::User, SkillScope::Repo, SkillScope::Admin] {
+        let snapshot = load_host_skill_root(root_for(&root, scope)).await;
 
-    assert_eq!(user_snapshot.errors, Vec::new());
-    assert_eq!(user_snapshot.skills.len(), 1);
-    assert_eq!(user_snapshot.skills[0].path_to_skills_md, target_skill);
-    assert_eq!(
-        user_snapshot
-            .skill_discovery_path_by_path
-            .get(&target_skill),
-        Some(&user_snapshot.root.join("alias/SKILL.md"))
-    );
+        assert_eq!(snapshot.errors, Vec::new());
+        assert_eq!(snapshot.skills.len(), 1);
+        assert_eq!(
+            (
+                &snapshot.skills[0].path_to_skills_md,
+                snapshot.skills[0].scope
+            ),
+            (&target_skill, scope)
+        );
+        assert_eq!(
+            snapshot.skill_discovery_path_by_path.get(&target_skill),
+            Some(&snapshot.root.join("alias/SKILL.md"))
+        );
+    }
+
+    let system_snapshot = load_host_skill_root(root_for(&root, SkillScope::System)).await;
     assert_eq!(system_snapshot.errors, Vec::new());
     assert_eq!(system_snapshot.skills, Vec::new());
 }

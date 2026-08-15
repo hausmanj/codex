@@ -22,6 +22,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::mcp::McpManager;
 use crate::plugins::list_tool_suggest_discoverable_plugins;
+use crate::plugins::plugins_manager_for_config;
 use crate::session::INITIAL_SUBMIT_ID;
 use codex_config::types::ApprovalsReviewer;
 use codex_config::types::ToolSuggestDiscoverableType;
@@ -119,7 +120,9 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
     config: &Config,
 ) -> Option<Vec<AppInfo>> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false)
+            .await
+            .ok()?;
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -186,7 +189,13 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_environment_manager(
     force_refetch: bool,
     environment_manager: Arc<EnvironmentManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
-    let plugins_manager = Arc::new(PluginsManager::new(config.codex_home.to_path_buf()));
+    let auth_manager =
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
+    let auth = auth_manager.auth().await;
+    let plugins_manager = Arc::new(plugins_manager_for_config(
+        config,
+        auth.as_ref().map(CodexAuth::api_auth_mode),
+    ));
     let mcp_manager = Arc::new(McpManager::new(plugins_manager));
     list_accessible_connectors_from_mcp_tools_with_mcp_manager(
         config,
@@ -204,7 +213,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     mcp_manager: Arc<McpManager>,
 ) -> anyhow::Result<AccessibleConnectorsStatus> {
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await?;
     let auth = auth_manager.auth().await;
     if !config
         .features
@@ -426,8 +435,11 @@ async fn cached_directory_connectors_for_tool_suggest_with_auth(
     let auth = if let Some(auth) = auth {
         Some(auth)
     } else {
-        let auth_manager =
-            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
+        let Ok(auth_manager) =
+            AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await
+        else {
+            return Vec::new();
+        };
         loaded_auth = auth_manager.auth().await;
         loaded_auth.as_ref()
     };
@@ -503,25 +515,18 @@ pub fn with_app_plugin_sources(
     connectors
 }
 
-pub(crate) fn mcp_approvals_reviewer(
-    config: &Config,
-    server_name: &str,
-    connector_id: Option<&str>,
-) -> ApprovalsReviewer {
-    mcp_approvals_reviewer_from_layers(
-        &config.config_layer_stack,
-        config.approvals_reviewer,
-        server_name,
-        connector_id,
-    )
-}
-
 pub(crate) fn mcp_approvals_reviewer_from_layers(
     config_layer_stack: &codex_config::ConfigLayerStack,
     default_reviewer: ApprovalsReviewer,
+    model: Option<&str>,
     server_name: &str,
     connector_id: Option<&str>,
 ) -> ApprovalsReviewer {
+    let requirements = config_layer_stack.requirements();
+    if model.is_some_and(|model| requirements.auto_review_required_for_model(model)) {
+        return ApprovalsReviewer::AutoReview;
+    }
+
     let app_reviewer = if server_name == CODEX_APPS_MCP_SERVER_NAME {
         apps_config_from_layer_stack(config_layer_stack).and_then(|apps_config| {
             connector_id
@@ -538,11 +543,7 @@ pub(crate) fn mcp_approvals_reviewer_from_layers(
     };
 
     if let Some(reviewer) = app_reviewer
-        && config_layer_stack
-            .requirements()
-            .approvals_reviewer
-            .can_set(&reviewer)
-            .is_ok()
+        && requirements.approvals_reviewer.can_set(&reviewer).is_ok()
     {
         return reviewer;
     }

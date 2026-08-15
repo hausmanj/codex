@@ -59,15 +59,18 @@ use crate::tools::registry::RegisteredTool;
 use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolRouter;
+use crate::tools::tool_namespaces_info::collect_tool_namespaces_info;
 use codex_extension_api::ExtensionData;
 use codex_features::Feature;
 use codex_login::AuthManager;
+use codex_protocol::DEFAULT_FUNCTION_NAMESPACE;
 use codex_protocol::account::PlanType;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
@@ -370,6 +373,11 @@ pub(crate) fn finalize_tool_router(
     }
 
     let code_mode_tool_names = register_code_mode_executors(turn_context, &mut registry);
+    let include_tool_namespaces_info = turn_context
+        .config
+        .tool_registry
+        .turn_metadata_includes_tool_info
+        && turn_context.model_info.use_responses_lite;
 
     if turn_context.config.tool_registry.error_on_tool_collisions {
         if let Some(tool_name) = registry.first_collision() {
@@ -379,6 +387,7 @@ pub(crate) fn finalize_tool_router(
         }
 
         let mut namespace_descriptions = BTreeMap::new();
+        let mut namespace_owners = BTreeMap::new();
         for tool in registry.entries() {
             let owned_spec;
             let spec = if let Some(spec) = tool.runtime.immutable_spec() {
@@ -387,6 +396,27 @@ pub(crate) fn finalize_tool_router(
                 owned_spec = tool.runtime.spec();
                 &owned_spec
             };
+            if include_tool_namespaces_info && tool.exposure != ToolExposure::Hidden {
+                let namespace_name = match spec {
+                    ToolSpec::Namespace(namespace) => namespace.name.as_str(),
+                    ToolSpec::Function(_) | ToolSpec::Freeform(_) => DEFAULT_FUNCTION_NAMESPACE,
+                    ToolSpec::ToolSearch { .. } => TOOL_SEARCH_TOOL_NAME,
+                    ToolSpec::WebSearch { .. } => continue,
+                };
+                let owner = tool.runtime.mcp_server_name();
+                match namespace_owners.get(namespace_name) {
+                    Some(existing_owner) if existing_owner != &owner => {
+                        return Err(
+                            CodexErrorDetails::ToolCollision(namespace_name.to_string()).into()
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        namespace_owners.insert(namespace_name.to_string(), owner);
+                    }
+                }
+            }
+
             let ToolSpec::Namespace(namespace) = spec else {
                 continue;
             };
@@ -407,6 +437,16 @@ pub(crate) fn finalize_tool_router(
 
     let model_visible_specs =
         build_model_visible_specs(turn_context, &registry, &code_mode_tool_names, hosted_specs);
+    if include_tool_namespaces_info {
+        turn_context
+            .turn_metadata_state
+            .set_tool_namespaces_info(collect_tool_namespaces_info(
+                &registry,
+                &code_mode_tool_names,
+                &model_visible_specs,
+            ));
+    }
+
     Ok(ToolRouter::from_parts(registry, model_visible_specs))
 }
 
@@ -743,12 +783,6 @@ fn register_code_mode_executors(
         code_mode_nested_tool_specs.push((spec, cached_runtime));
     }
 
-    if turn_context.model_info.use_responses_lite {
-        turn_context
-            .turn_metadata_state
-            .set_code_mode_tool_names(code_mode_tool_names.clone());
-    }
-
     let namespace_descriptions = code_mode_namespace_descriptions(&exec_prompt_tool_specs);
     let mut enabled_tools =
         collect_code_mode_exec_prompt_tool_definitions(exec_prompt_tool_specs.iter());
@@ -857,9 +891,16 @@ fn code_mode_namespace_descriptions(
 #[instrument(level = "trace", skip_all)]
 fn add_core_tool_sources(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistry) {
     // Guardian reviewers receive only `exec_command`, `write_stdin`, and `view_image`
-    // when an environment is available; all general tool sources stay excluded.
+    // when a managed sandbox can enforce the parent's filesystem restrictions;
+    // all general tool sources stay excluded.
     if crate::guardian::is_guardian_reviewer_source(&context.turn_context.session_source) {
         let turn_context = context.turn_context;
+        if !matches!(
+            turn_context.permission_profile(),
+            PermissionProfile::Managed { .. }
+        ) {
+            return;
+        }
         let environment_mode = tool_environment_mode(context.environments);
         if environment_mode.has_environment() {
             let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
@@ -913,7 +954,7 @@ fn tool_environment_mode(environments: &TurnEnvironmentSnapshot) -> ToolEnvironm
 fn any_environment_allows_login_shell(environments: &TurnEnvironmentSnapshot) -> bool {
     environments
         .turn_environments()
-        .any(|environment| environment.config.allow_login_shell)
+        .any(|environment| environment.config().allow_login_shell)
 }
 
 #[instrument(level = "trace", skip_all)]
