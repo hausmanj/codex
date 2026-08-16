@@ -31,6 +31,7 @@ pub use feature_configs::NetworkProxyModeToml;
 pub use feature_configs::NetworkProxyUnixSocketPermissionToml;
 pub use feature_configs::NonPrefixedMcpToolNamesConfigToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
+pub use feature_configs::RepeatGuardConfigToml;
 pub use feature_configs::RolloutBudgetConfigToml;
 pub use feature_configs::TokenBudgetConfigToml;
 pub use feature_configs::ToolRegistryConfigToml;
@@ -272,6 +273,8 @@ pub enum Feature {
     RolloutBudget,
     /// Add current-time reminders to model-visible context.
     CurrentTimeReminder,
+    /// Block tool calls that repeat an unchanged command with an identical result.
+    RepeatGuard,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
     /// Prompt Codex Apps connector auth failures through MCP URL elicitations.
@@ -708,6 +711,8 @@ pub struct FeaturesToml {
     pub rollout_budget: Option<FeatureToml<RolloutBudgetConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_time_reminder: Option<FeatureToml<CurrentTimeReminderConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_guard: Option<FeatureToml<RepeatGuardConfigToml>>,
     #[serde(default, rename = "apps_mcp_path_override", skip_serializing)]
     #[schemars(skip)]
     removed_apps_mcp_path_override: Option<FeatureToml<RemovedAppsMcpPathOverrideConfigToml>>,
@@ -758,6 +763,9 @@ impl FeaturesToml {
             .and_then(FeatureToml::enabled)
         {
             entries.insert(Feature::CurrentTimeReminder.key().to_string(), enabled);
+        }
+        if let Some(enabled) = self.repeat_guard.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::RepeatGuard.key().to_string(), enabled);
         }
         if let Some(enabled) = self.network_proxy.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::NetworkProxy.key().to_string(), enabled);
@@ -1389,6 +1397,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "current_time_reminder",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::RepeatGuard,
+        key: "repeat_guard",
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::CollaborationModes,

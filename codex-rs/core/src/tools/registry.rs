@@ -11,6 +11,9 @@ use crate::hook_runtime::run_post_tool_use_hooks;
 use crate::hook_runtime::run_pre_tool_use_hooks;
 use crate::memory_usage::emit_metric_for_tool_read;
 use crate::memory_usage::shell_script_for_invocation;
+use crate::tools::repeat_guard::RepeatCallGuard;
+use crate::tools::repeat_guard::repeat_result_hash;
+use crate::tools::repeat_guard::repeat_signature;
 use crate::sandbox_tags::permission_profile_policy_tag;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
 use crate::session::session::Session;
@@ -612,6 +615,18 @@ impl ToolRegistry {
             }
         }
 
+        if let Some(block_message) = repeat_guard_precheck(&invocation).await {
+            let err = FunctionCallError::RespondToModel(block_message);
+            dispatch_trace.record_failed(&err);
+            notify_tool_finish_if_unclaimed(
+                &invocation,
+                terminal_outcome_reached.as_deref(),
+                ToolCallOutcome::Blocked,
+            )
+            .await;
+            return Err(err);
+        }
+
         notify_tool_start(&invocation).await;
 
         if let Some(command) = shell_script_for_invocation(&invocation) {
@@ -746,6 +761,7 @@ impl ToolRegistry {
                         });
                     }
                 }
+                repeat_guard_record_outcome(&invocation, &result);
                 tool.on_tool_result_accepted(&invocation, result.result.as_ref());
                 dispatch_trace.record_completed(
                     &invocation,
@@ -759,6 +775,52 @@ impl ToolRegistry {
                 dispatch_trace.record_failed(&err);
                 Err(err)
             }
+        }
+    }
+}
+
+/// Pre-execution repeat-guard check. Returns the model-facing block message when
+/// this invocation must not run, or `None` to proceed. The guard is a no-op
+/// unless config resolved it (feature enabled and no env bypass).
+async fn repeat_guard_precheck(invocation: &ToolInvocation) -> Option<String> {
+    if invocation.turn.config.repeat_guard.is_none() {
+        return None;
+    }
+    let signature = repeat_signature(&invocation.tool_name, &invocation.payload, &invocation.turn)?;
+    let mut guard = invocation.session.services.repeat_call_guard.lock().await;
+    guard.check(&signature)
+}
+
+/// Records the outcome of an executed tool call for the repeat guard: a
+/// successful state-changing call clears history; otherwise the result is
+/// recorded under its signature. No-op when the guard is disabled or the tool
+/// is untracked.
+fn repeat_guard_record_outcome(invocation: &ToolInvocation, result: &AnyToolResult) {
+    if invocation.turn.config.repeat_guard.is_none() {
+        return;
+    }
+    let Some(signature) =
+        repeat_signature(&invocation.tool_name, &result.payload, &invocation.turn)
+    else {
+        return;
+    };
+    let success = result.result.success_for_logging();
+    let state_changing = if success {
+        let flat_name = flat_tool_name(&invocation.tool_name);
+        RepeatCallGuard::is_state_changing_tool(&flat_name)
+            || shell_script_for_invocation(invocation)
+                .is_some_and(|script| RepeatCallGuard::is_mutating_shell_script(&script))
+    } else {
+        false
+    };
+    let result_hash = repeat_result_hash(result.result.as_ref(), &result.call_id, &result.payload);
+    // Synchronous record under a try_lock: dispatch already holds no guard lock
+    // here, but keep this non-async so the call site stays simple.
+    if let Ok(mut guard) = invocation.session.services.repeat_call_guard.try_lock() {
+        if state_changing {
+            guard.note_state_change();
+        } else {
+            guard.record(&signature, result_hash);
         }
     }
 }
