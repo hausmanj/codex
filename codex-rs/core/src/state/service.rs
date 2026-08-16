@@ -67,6 +67,8 @@ pub(crate) struct SessionServices {
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) tool_approvals: Mutex<ApprovalStore>,
     pub(crate) guardian_rejection_circuit_breaker: Mutex<GuardianRejectionCircuitBreaker>,
+    /// No-progress circuit breaker for repeated unchanged tool calls (v2).
+    pub(crate) repeat_call_guard: Mutex<crate::tools::repeat_guard::RepeatCallGuard>,
     pub(crate) runtime_handle: Handle,
     pub(crate) skills_service: Arc<HostSkillsService>,
     pub(crate) agents_md_manager: Arc<AgentsMdManager>,

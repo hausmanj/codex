@@ -1398,6 +1398,14 @@ impl Session {
                 models_manager: Arc::clone(&models_manager),
                 tool_approvals: Mutex::new(ApprovalStore::default()),
                 guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
+                repeat_call_guard: tokio::sync::Mutex::new(
+                    crate::tools::repeat_guard::RepeatCallGuard::new(
+                        config
+                            .repeat_guard
+                            .map(|c| c.block_after_repeats)
+                            .unwrap_or(crate::tools::repeat_guard::DEFAULT_BLOCK_AFTER_REPEATS),
+                    ),
+                ),
                 runtime_handle: tokio::runtime::Handle::current(),
                 skills_service,
                 agents_md_manager,
