@@ -72,6 +72,7 @@ use codex_features::Features;
 use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
+use codex_features::RepeatGuardConfigToml;
 use codex_features::TokenBudgetConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
@@ -1038,6 +1039,10 @@ pub struct Config {
     /// Current-time reminder and clock tool configuration, when enabled.
     pub current_time_reminder: Option<CurrentTimeReminderConfig>,
 
+    /// Repeat-call guard configuration (blocking repeated unchanged commands with
+    /// identical results). `None` when the feature is disabled or bypassed via env.
+    pub repeat_guard: Option<RepeatGuardConfig>,
+
     /// Centralized feature flags; source of truth for feature gating.
     pub features: ManagedFeatures,
 
@@ -1243,6 +1248,21 @@ impl Default for CurrentTimeReminderConfig {
             clock_source: CurrentTimeSource::System,
             delivery_mode: CurrentTimeReminderDeliveryMode::AnyInference,
             sleep_tool: false,
+        }
+    }
+}
+
+/// Effective repeat-call guard settings for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RepeatGuardConfig {
+    /// Number of identical (command, result) observations before the next call is blocked.
+    pub block_after_repeats: u32,
+}
+
+impl Default for RepeatGuardConfig {
+    fn default() -> Self {
+        Self {
+            block_after_repeats: 3,
         }
     }
 }
@@ -2877,6 +2897,43 @@ fn resolve_current_time_reminder_config(
     }))
 }
 
+/// Whether the env-var bypass disables the repeat guard for this process:
+/// `CODEX_REPEAT_GUARD=0` or legacy `CODEX_ALLOW_REPEAT_TOOLS=1`.
+fn repeat_guard_env_bypassed() -> bool {
+    crate::tools::repeat_guard::RepeatCallGuard::env_bypass_active()
+}
+
+/// Resolves the effective repeat-call guard configuration.
+///
+/// Returns `None` (guard fully disabled) when any of these holds, in order:
+/// - env bypass `CODEX_REPEAT_GUARD=0` (or legacy `CODEX_ALLOW_REPEAT_TOOLS=1`)
+/// - feature flag `repeat_guard = false` in config
+fn resolve_repeat_guard_config(
+    config_toml: &ConfigToml,
+    features: &ManagedFeatures,
+) -> Option<RepeatGuardConfig> {
+    if repeat_guard_env_bypassed() {
+        return None;
+    }
+    if !features.enabled(Feature::RepeatGuard) {
+        return None;
+    }
+    let base = repeat_guard_toml_config(config_toml.features.as_ref());
+    let default = RepeatGuardConfig::default();
+    Some(RepeatGuardConfig {
+        block_after_repeats: base
+            .and_then(|config| config.block_after_repeats)
+            .unwrap_or(default.block_after_repeats),
+    })
+}
+
+fn repeat_guard_toml_config(features: Option<&FeaturesToml>) -> Option<&RepeatGuardConfigToml> {
+    match features?.repeat_guard.as_ref()? {
+        FeatureToml::Enabled(_) => None,
+        FeatureToml::Config(config) => Some(config),
+    }
+}
+
 fn resolve_terminal_resize_reflow_config(config_toml: &ConfigToml) -> TerminalResizeReflowConfig {
     let Some(tui) = config_toml.tui.as_ref() else {
         return TerminalResizeReflowConfig::default();
@@ -3671,6 +3728,7 @@ impl Config {
         let token_budget = resolve_token_budget_config(&cfg, &features)?;
         let rollout_budget = resolve_rollout_budget_config(&cfg, &features)?;
         let current_time_reminder = resolve_current_time_reminder_config(&cfg, &features)?;
+        let repeat_guard = resolve_repeat_guard_config(&cfg, &features);
         let terminal_resize_reflow = resolve_terminal_resize_reflow_config(&cfg);
 
         let agent_roles =
@@ -4266,6 +4324,7 @@ impl Config {
             token_budget,
             rollout_budget,
             current_time_reminder,
+            repeat_guard,
             features,
             suppress_unstable_features_warning: cfg
                 .suppress_unstable_features_warning

@@ -321,6 +321,25 @@ impl FeatureConfig for TokenBudgetConfigToml {
     }
 }
 
+/// Configuration for the repeat-call guard that blocks tool calls repeating an
+/// unchanged command with an identical result.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepeatGuardConfigToml {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Number of identical (command, result) observations before the next call is blocked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 2))]
+    pub block_after_repeats: Option<u32>,
+}
+
+impl FeatureConfig for RepeatGuardConfigToml {
+    fn enabled(&self) -> Option<bool> {
+        self.enabled
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RolloutBudgetConfigToml {

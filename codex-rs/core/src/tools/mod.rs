@@ -12,6 +12,7 @@ pub(crate) mod network_approval;
 pub(crate) mod orchestrator;
 pub(crate) mod parallel;
 pub(crate) mod registry;
+pub(crate) mod repeat_guard;
 pub(crate) mod router;
 pub(crate) mod runtimes;
 pub(crate) mod sandboxing;
