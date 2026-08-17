@@ -27,6 +27,25 @@ impl ChatWidget {
         }
     }
 
+    /// Announces that compaction has started.
+    ///
+    /// Compaction streams no deltas, so without this the UI is completely silent from the moment
+    /// compaction begins until the replacement history lands. On a local model summarizing a full
+    /// context window that gap can run for many minutes, which reads as a hang and invites the
+    /// user to interrupt a turn that is in fact making progress.
+    pub(super) fn on_context_compaction_begin(&mut self) {
+        self.flush_answer_stream_with_separator();
+        self.add_to_history(history_cell::new_info_event(
+            "Compacting context".to_string(),
+            Some("summarizing the thread to free up context; this can take a while".to_string()),
+        ));
+        if self.bottom_pane.is_task_running() {
+            self.bottom_pane.ensure_status_indicator();
+        }
+        self.set_status_header(String::from("Compacting context"));
+        self.request_redraw();
+    }
+
     pub(super) fn on_image_generation_end(
         &mut self,
         call_id: String,

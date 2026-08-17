@@ -363,6 +363,9 @@ impl ChatWidget {
             ThreadItem::EnteredReviewMode { review, .. } if !from_replay => {
                 self.enter_review_mode_with_hint(review, /*from_replay*/ false);
             }
+            ThreadItem::ContextCompaction { .. } if !from_replay => {
+                self.on_context_compaction_begin();
+            }
             _ => {}
         }
     }

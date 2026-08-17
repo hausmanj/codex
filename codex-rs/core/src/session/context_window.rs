@@ -29,12 +29,13 @@ pub(crate) async fn context_window_token_status(
     // Count either the full active context or only the tokens added after the initial prefix.
     let (auto_compact_scope_tokens, auto_compact_scope_limit, auto_compact_window_prefill_tokens) =
         match turn_context.config.model_auto_compact_token_limit_scope {
+            // `model_auto_compact_token_limit` is already folded into `model_info` by
+            // `with_config_overrides`, and the accessor additionally clamps it to 90% of the
+            // resolved context window. Reading the raw config value here would honor a limit
+            // larger than the window itself and never compact until the hard cap.
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
-                turn_context
-                    .config
-                    .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit()),
+                turn_context.model_info.auto_compact_token_limit(),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {

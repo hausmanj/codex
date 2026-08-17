@@ -1229,6 +1229,9 @@ async fn run_auto_compact(
             run_inline_auto_compact_task(
                 Arc::clone(sess),
                 Arc::clone(turn_context),
+                // Reuse this step's finalized tool plan so the compaction request shares a
+                // prompt prefix with the conversation it is summarizing.
+                step_context.tool_router.model_visible_specs(),
                 initial_context_injection,
                 reason,
                 phase,
