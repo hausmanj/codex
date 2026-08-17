@@ -5267,3 +5267,92 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
 
     Ok(())
 }
+
+/// Compaction must advertise the same tools as the conversation it is summarizing.
+///
+/// Local runtimes render the tool list into the prompt prefix, so a tool-free compaction request
+/// diverges from the thread at token zero and forfeits the KV prefix cache — the entire context
+/// gets prefilled again, which stalls the UI for minutes on a local model.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn auto_compact_request_advertises_same_tools_as_sampling_request() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", "SECOND_REPLY"),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+    ]);
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", FINAL_REPLY),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200_000);
+    });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    for text in [FIRST_AUTO_MSG, SECOND_AUTO_MSG, POST_AUTO_USER_MSG] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .unwrap();
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+
+    let requests = request_log.requests();
+    let auto_compact_index = requests
+        .iter()
+        .enumerate()
+        .find_map(|(idx, request)| {
+            body_contains_text(&request.body_json().to_string(), SUMMARIZATION_PROMPT)
+                .then_some(idx)
+        })
+        .expect("auto compact request missing");
+
+    let tool_names = |body: &serde_json::Value| -> Vec<String> {
+        body.get("tools")
+            .and_then(|tools| tools.as_array())
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        tool.get("name")
+                            .and_then(|name| name.as_str())
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let sampling_tools = tool_names(&requests[0].body_json());
+    let compaction_tools = tool_names(&requests[auto_compact_index].body_json());
+
+    assert!(
+        !sampling_tools.is_empty(),
+        "sampling request should advertise tools; otherwise this test proves nothing"
+    );
+    assert_eq!(
+        compaction_tools, sampling_tools,
+        "compaction request must advertise the same tools as the sampling request so the two \
+         share a prompt prefix"
+    );
+}
