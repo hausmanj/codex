@@ -60,6 +60,7 @@ mod compact_resume_fork;
 mod current_time_reminder;
 mod cyber_exec_policy;
 mod deprecation_notice;
+mod empty_completion_retry;
 mod exec;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
