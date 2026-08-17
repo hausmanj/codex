@@ -35,6 +35,7 @@ use core_test_support::responses::ev_message_item_added;
 use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_reasoning_item_added;
+use core_test_support::responses::ev_reasoning_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::StreamingSseServer;
@@ -1375,5 +1376,77 @@ async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_
         "steered input should be recorded on the request after the post-compact continuation"
     );
 
+    server.shutdown().await;
+}
+
+/// A message typed during a long generation must not wait for that generation
+/// to finish.
+///
+/// Pending input is otherwise only drained between sampling requests, so on a
+/// local model -- where one request can run for many minutes inside a `<think>`
+/// block -- a steer sat untouched the whole time and the UI looked like it was
+/// ignoring the user. The stream is cut at the next delta instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_preempts_an_in_flight_generation_before_it_completes() {
+    const INITIAL_PROMPT: &str = "audit the album repository";
+    const STEER_PROMPT: &str = "I see you thinking over here whats going on?";
+
+    let (never_complete_tx, never_complete_rx) = oneshot::channel();
+    let mut first_chunks = vec![
+        chunk(ev_response_created("resp-1")),
+        chunk(ev_reasoning_item_added("reasoning-1", &[])),
+    ];
+    // A long think: enough deltas to cross the preemption check interval several
+    // times over, with no output item ever completing.
+    for i in 0..200 {
+        first_chunks.push(chunk(ev_reasoning_text_delta(&format!(
+            "still reasoning, step {i}. "
+        ))));
+    }
+    // Held open forever. If preemption does not fire, the turn hangs here and the
+    // second request never happens.
+    first_chunks.push(gated_chunk(never_complete_rx, vec![ev_completed("resp-1")]));
+
+    let (server, _completions) =
+        start_streaming_sse_server(vec![first_chunks, response_completed_chunks("resp-2")]).await;
+    let codex = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::PreemptOnUserInput)
+                .expect("test config should allow feature update");
+        })
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build Codex test session")
+        .codex;
+
+    submit_user_input(&codex, INITIAL_PROMPT).await;
+    // Wait until the model is actually mid-think before steering.
+    wait_for_event(&codex, |event| {
+        matches!(event, EventMsg::ReasoningRawContentDelta(_))
+    })
+    .await;
+
+    steer_user_input(&codex, STEER_PROMPT).await;
+
+    // The point of the change: a second request goes out while the first
+    // response is still open.
+    server.wait_for_request_count(2).await;
+
+    let requests = server.requests().await;
+    let second: Value = from_slice(&requests[1]).expect("parse second request");
+    let user_input = message_input_texts(&second, "user")
+        .into_iter()
+        .filter(|text| text == INITIAL_PROMPT || text == STEER_PROMPT)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_input,
+        vec![INITIAL_PROMPT.to_string(), STEER_PROMPT.to_string()],
+        "the steer must reach the model on the follow-up request"
+    );
+
+    drop(never_complete_tx);
+    wait_for_turn_complete(&codex).await;
     server.shutdown().await;
 }

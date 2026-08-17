@@ -292,6 +292,9 @@ pub enum Feature {
     CurrentTimeReminder,
     /// Block tool calls that repeat an unchanged command with an identical result.
     RepeatGuard,
+    /// Cut an in-flight generation short as soon as the user types, instead of
+    /// waiting for the response and its tool calls to finish.
+    PreemptOnUserInput,
     /// Route MCP tool approval prompts through the MCP elicitation request path.
     ToolCallMcpElicitation,
     /// Prompt Codex Apps connector auth failures through MCP URL elicitations.
@@ -1456,6 +1459,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "repeat_guard",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::PreemptOnUserInput,
+        key: "preempt_on_user_input",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::CollaborationModes,

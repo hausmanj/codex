@@ -361,10 +361,33 @@ impl InputQueue {
         }
         self.has_pending_mailbox_items().await
     }
+
+    /// Whether the user has typed something that is waiting on the current turn.
+    ///
+    /// Deliberately narrower than [`Self::has_pending_input`]: it ignores
+    /// mailbox traffic and queued response items, so it answers only "is a
+    /// person waiting for an answer right now". Mid-stream preemption keys off
+    /// this, and preempting a long generation for internal mail would be a poor
+    /// trade -- mail is already handled at output-item boundaries.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state reads must remain atomic"
+    )]
+    pub(crate) async fn has_pending_user_input(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+    ) -> bool {
+        let active = active_turn.lock().await;
+        let Some(active_turn) = active.as_ref() else {
+            return false;
+        };
+        let turn_state = active_turn.turn_state.lock().await;
+        turn_state.pending_input.has_user_input()
+    }
 }
 
 impl TurnInputQueue {
-    fn has_user_input(&self) -> bool {
+    pub(crate) fn has_user_input(&self) -> bool {
         self.items
             .iter()
             .any(|input| matches!(input, TurnInput::UserInput { .. }))
