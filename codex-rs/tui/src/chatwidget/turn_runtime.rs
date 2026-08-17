@@ -92,6 +92,11 @@ impl ChatWidget {
         if self.mcp_startup_status.is_none() || !self.status_header_is_mcp_startup_owned() {
             self.set_status_header(String::from("Working"));
         }
+        // Start reporting proof-of-life immediately: the gap before the first
+        // token is prompt processing, and on a long context that alone can run
+        // for minutes.
+        self.on_turn_progress_start();
+        self.render_turn_progress();
         self.reasoning_summary_parts.clear();
         self.reasoning_buffer.clear();
         self.reasoning_header = None;
@@ -109,6 +114,7 @@ impl ChatWidget {
         from_replay: bool,
     ) {
         self.input_queue.submit_pending_steers_after_interrupt = false;
+        self.on_turn_progress_end();
         let sanitized_last_agent_message = last_agent_message.as_deref().map(|message| {
             parse_assistant_markdown(message, self.config.cwd.as_path()).visible_markdown
         });

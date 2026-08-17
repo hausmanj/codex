@@ -434,8 +434,10 @@ mod transcript;
 mod transcript_export;
 use self::transcript::TranscriptState;
 mod turn_lifecycle;
+mod turn_progress;
 mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
+use self::turn_progress::TurnProgress;
 mod usage;
 mod user_messages;
 use self::user_messages::PendingSteer;
@@ -615,6 +617,8 @@ pub(crate) struct ChatWidget {
     /// Compaction streams reasoning/summary deltas but must not write them to the transcript,
     /// so they are accumulated here and surfaced through the status indicator instead.
     compaction_progress: Option<CompactionProgress>,
+    /// Proof-of-life for the in-flight sampling request; see [`turn_progress`].
+    turn_progress: Option<TurnProgress>,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     /// Tracks per-server MCP startup state while startup is in progress.
     ///

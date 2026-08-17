@@ -76,6 +76,7 @@ impl ChatWidget {
                 self.handle_item_completed_notification(notification, replay_kind);
             }
             ServerNotification::AgentMessageDelta(notification) => {
+                self.on_turn_progress_delta(&notification.delta);
                 self.on_agent_message_delta(notification.delta);
             }
             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
@@ -85,10 +86,16 @@ impl ChatWidget {
                 if self.compaction_progress.is_some() {
                     self.on_context_compaction_progress(&notification.delta);
                 } else {
+                    self.on_turn_progress_delta(&notification.delta);
                     self.on_agent_reasoning_delta(notification.delta);
                 }
             }
             ServerNotification::ReasoningTextDelta(notification) => {
+                // Record progress regardless of the display setting. A model
+                // that spends its whole run inside a `<think>` block emits
+                // nothing else, so gating this on `show_raw_agent_reasoning`
+                // would leave the status line silent for the entire turn.
+                self.on_turn_progress_delta(&notification.delta);
                 if self.config.show_raw_agent_reasoning {
                     self.on_agent_reasoning_delta(notification.delta);
                 }
