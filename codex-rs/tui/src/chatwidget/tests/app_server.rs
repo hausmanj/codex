@@ -1623,4 +1623,49 @@ async fn context_compaction_started_announces_progress() {
         .status_widget()
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Compacting context");
+
+    // Compaction reuses the reasoning-delta channel to report progress. It must drive the status
+    // line rather than the transcript, so a long summarization visibly advances.
+    for delta in ["Reviewing the auth", " refactor and the"] {
+        chat.handle_server_notification(
+            ServerNotification::ReasoningSummaryTextDelta(
+                codex_app_server_protocol::ReasoningSummaryTextDeltaNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "compaction-1".to_string(),
+                    delta: delta.to_string(),
+                    summary_index: 0,
+                },
+            ),
+            /*replay_kind*/ None,
+        );
+    }
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    let details = status.details().unwrap_or_default();
+    assert!(
+        details.contains("tokens") && details.contains("refactor"),
+        "status should show streamed compaction progress, got: {details}"
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "compaction progress must not be written to the transcript"
+    );
+
+    // Completing the item clears progress so later reasoning resumes normal rendering.
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            completed_at_ms: 0,
+            item: AppServerThreadItem::ContextCompaction {
+                id: "compaction-1".to_string(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    assert!(chat.compaction_progress.is_none());
 }
