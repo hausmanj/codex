@@ -933,3 +933,213 @@ mod mutation_classification_tests {
         );
     }
 }
+
+/// Shell tokens that write somewhere: redirections and in-place stream writers.
+/// `2>&1` is deliberately absent — it redirects a stream to another stream and
+/// touches nothing.
+fn script_writes_output(script: &str) -> bool {
+    let mut chars = script.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch != '>' {
+            continue;
+        }
+        // `2>&1`, `>&2` and friends rewire descriptors without writing a file.
+        let redirects_to_descriptor =
+            script[idx + 1..].starts_with('&') || script[idx + 1..].starts_with(">&");
+        if !redirects_to_descriptor {
+            return true;
+        }
+    }
+    // `tee` writes files even without a redirection operator.
+    script
+        .split(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == '&')
+        .any(|token| token == "tee")
+}
+
+/// Programs that change state on success. Read-only tools an agent commonly
+/// loops on (curl, ping, nc, git status/log/diff, docker ps, python -c ...) are
+/// intentionally absent so their repeats accumulate.
+fn invokes_mutating_program(cmd: &str) -> bool {
+    const MUTATING: &[&str] = &[
+        "rm", "rmdir", "mv", "cp", "mkdir", "touch", "chmod", "chown", "ln", "truncate", "dd",
+        "install", "patch", "tee", "make", "cmake", "ninja",
+    ];
+    // Subcommand-sensitive tools: only some verbs mutate.
+    const MUTATING_SUBCOMMANDS: &[(&str, &[&str])] = &[
+        (
+            "git",
+            &[
+                "commit",
+                "add",
+                "rm",
+                "mv",
+                "checkout",
+                "switch",
+                "restore",
+                "reset",
+                "merge",
+                "rebase",
+                "cherry-pick",
+                "revert",
+                "push",
+                "pull",
+                "fetch",
+                "clone",
+                "apply",
+                "stash",
+                "clean",
+                "tag",
+                "branch",
+                "init",
+            ],
+        ),
+        (
+            "npm",
+            &[
+                "install",
+                "i",
+                "ci",
+                "uninstall",
+                "update",
+                "run",
+                "publish",
+            ],
+        ),
+        ("pnpm", &["install", "i", "add", "remove", "update", "run"]),
+        ("yarn", &["install", "add", "remove", "upgrade", "run"]),
+        ("pip", &["install", "uninstall"]),
+        ("pip3", &["install", "uninstall"]),
+        ("uv", &["pip", "add", "remove", "sync", "install"]),
+        (
+            "cargo",
+            &["add", "remove", "install", "publish", "fix", "clean"],
+        ),
+        (
+            "brew",
+            &["install", "uninstall", "upgrade", "link", "unlink"],
+        ),
+        (
+            "docker",
+            &[
+                "run", "rm", "rmi", "build", "start", "stop", "restart", "compose",
+            ],
+        ),
+        ("kubectl", &["apply", "delete", "create", "patch", "scale"]),
+        (
+            "systemctl",
+            &["start", "stop", "restart", "enable", "disable"],
+        ),
+    ];
+
+    let mut tokens = cmd
+        .split_whitespace()
+        .skip_while(|token| token.contains('=') || matches!(*token, "sudo" | "env" | "command"));
+    let Some(program) = tokens.next() else {
+        return false;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+
+    if MUTATING.contains(&program) {
+        return true;
+    }
+    // `sed -i` edits in place; plain `sed` is a filter.
+    if program == "sed" {
+        return cmd
+            .split_whitespace()
+            .any(|t| t == "-i" || t.starts_with("-i."));
+    }
+    if let Some((_, verbs)) = MUTATING_SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == program)
+    {
+        let subcommand = tokens.find(|token| !token.starts_with('-'));
+        return subcommand.is_some_and(|verb| verbs.contains(&verb));
+    }
+    false
+}
+
+#[cfg(test)]
+mod mutation_classification_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    /// The exact command that looped in a live session. It is read-only, so it
+    /// must not count as a state change; otherwise every call clears the history
+    /// and the guard can never reach its threshold.
+    #[test]
+    fn looping_curl_pipeline_is_not_a_state_change() {
+        let script = "cd ~/source/immich && timeout 8 curl -s \
+            http://127.0.0.1:2285/api/server-info/ping -H 'Accept: text/html' -v 2>&1 \
+            | grep -E '^< (HTTP|Content)'";
+        assert!(!RepeatCallGuard::is_mutating_shell_script(script));
+    }
+
+    #[test]
+    fn read_only_probes_are_not_state_changes() {
+        for script in [
+            "ping -c 3 192.168.0.253",
+            "nc -z -w 4 192.168.0.253 2285",
+            "git status -sb",
+            "git log --oneline -15",
+            "git diff --stat",
+            "docker ps --filter name=mobile-test",
+            "cat README.md",
+            "ls -la /tmp",
+            "python3 -c 'print(1)'",
+            "curl -s http://localhost:8080 2>&1 | head -c 300",
+        ] {
+            assert!(
+                !RepeatCallGuard::is_mutating_shell_script(script),
+                "should not be mutating: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_mutations_are_state_changes() {
+        for script in [
+            "rm -rf build",
+            "mkdir -p out",
+            "mv a b",
+            "echo hi > file.txt",
+            "echo hi >> file.txt",
+            "cat x | tee out.txt",
+            "git commit -m 'x'",
+            "git checkout main",
+            "npm install",
+            "pip install requests",
+            "docker run --rm alpine",
+            "sed -i 's/a/b/' file.txt",
+            "make",
+        ] {
+            assert!(
+                RepeatCallGuard::is_mutating_shell_script(script),
+                "should be mutating: {script}"
+            );
+        }
+    }
+
+    /// `2>&1` rewires a descriptor; it writes nothing.
+    #[test]
+    fn stream_redirection_is_not_a_write() {
+        assert!(!script_writes_output("curl -v http://x 2>&1 | grep a"));
+        assert!(!script_writes_output("cmd >&2"));
+        assert!(script_writes_output("cmd > out.txt"));
+    }
+
+    /// End-to-end: three identical read-only calls, then the fourth is blocked.
+    #[test]
+    fn repeated_read_only_call_now_reaches_the_threshold() {
+        let mut guard = RepeatCallGuard::new(3);
+        let signature = "shell_command|curl -s http://x|/tmp||remote=false|approval=never|mode=default|win_sandbox=none";
+        let hash = "same-result".to_string();
+        for _ in 0..3 {
+            assert_eq!(guard.check(signature).is_none(), true);
+            guard.record(signature, hash.clone());
+        }
+        assert!(
+            guard.check(signature).is_some(),
+            "fourth identical call must be blocked"
+        );
+    }
+}
