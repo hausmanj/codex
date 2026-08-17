@@ -26,6 +26,11 @@ fn empty_completion(id: &str) -> String {
     ])
 }
 
+/// A completed response carrying no output items at all.
+fn silent_completion(id: &str) -> String {
+    sse(vec![ev_response_created(id), ev_completed(id)])
+}
+
 fn text_completion(id: &str, text: &str) -> String {
     sse(vec![
         ev_response_created(id),
@@ -109,6 +114,28 @@ async fn a_second_empty_completion_ends_the_turn_with_a_warning() -> Result<()> 
     assert!(
         warned,
         "a turn that ends with no answer must say so instead of completing in silence"
+    );
+    Ok(())
+}
+
+/// A response with NO output items is an ordinary way for a turn to end -- a
+/// queued-mail turn, a continuation that had nothing to add -- and must never be
+/// resampled. Keying the stall check on "no assistant message" instead of "a
+/// blank message item" conflated the two and resampled these into a loop that
+/// issued 32 requests where 2 were expected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_with_no_output_items_is_not_resampled() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = MockServer::start().await;
+    let responses = mount_sse_sequence(&server, vec![silent_completion("resp-1")]).await;
+
+    run_turn(&server, "nothing more to do here").await?;
+
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "an empty-but-valid completion must end the turn, not trigger a resample"
     );
     Ok(())
 }
