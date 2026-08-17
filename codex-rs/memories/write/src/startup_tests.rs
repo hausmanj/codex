@@ -203,6 +203,35 @@ async fn memories_startup_skipped_when_generate_memories_disabled() -> anyhow::R
 }
 
 #[tokio::test]
+async fn memories_startup_skipped_when_generate_memories_disabled() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let memory_root = home.path().join("memories");
+    let memories = MemoriesConfig {
+        generate_memories: false,
+        ..startup_test_memories_config()
+    };
+    let test = build_test_codex_with_memories_config(&server, home, memories).await?;
+
+    assert!(!memory_root.exists());
+    trigger_memories_startup(&test).await;
+
+    // Creating the memory root is the pipeline's first step, so its continued
+    // absence is the observable signal that the task returned early.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        assert!(
+            !tokio::fs::try_exists(&memory_root).await?,
+            "memories startup ran even though generate_memories is false"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_phase2_tracks_workspace_diff_across_runs() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);
