@@ -463,6 +463,35 @@ pub fn process_responses_event(
         }
         "response.completed" => {
             if let Some(resp_val) = event.response {
+                // A truncated generation does not always arrive as
+                // `response.incomplete`. Some providers -- mlx-lm among them --
+                // always name the event `response.completed` and record the
+                // truncation only as `status: "incomplete"` inside the payload.
+                // Parsed as an ordinary completion, that is indistinguishable
+                // from a model that simply had nothing to say: the turn ends
+                // with an empty assistant message and no explanation. Read the
+                // status and report the truncation, including the output-token
+                // count, which is what identifies a max-token cap.
+                if resp_val.get("status").and_then(Value::as_str) == Some("incomplete") {
+                    let reason = resp_val
+                        .get("incomplete_details")
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let output_tokens = resp_val
+                        .get("usage")
+                        .and_then(|usage| usage.get("output_tokens"))
+                        .and_then(Value::as_i64);
+                    let generated = match output_tokens {
+                        Some(tokens) => format!(" after generating {tokens} output tokens"),
+                        None => String::new(),
+                    };
+                    return Err(ResponsesEventError::Api(ApiError::Stream(format!(
+                        "Incomplete response returned, reason: {reason}{generated}. \
+                         The provider truncated this generation; if it stops at the same \
+                         token count every time, raise the server's max-tokens limit."
+                    ))));
+                }
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
                     Ok(resp) => {
                         return Ok(Some(ResponseEvent::Completed {
@@ -1152,6 +1181,80 @@ mod tests {
                     message,
                     "This request has been flagged for possible cybersecurity risk."
                 );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// mlx-lm always names the event `response.completed` and records a
+    /// max-token truncation only as `status: "incomplete"` in the payload.
+    /// Parsed as an ordinary completion it looks like a model with nothing to
+    /// say, and the turn ends with no explanation.
+    #[tokio::test]
+    async fn completed_event_with_incomplete_status_reports_truncation() {
+        let raw = json!({
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": {
+                "id": "resp_truncated",
+                "object": "response",
+                "status": "incomplete",
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 44,
+                    "output_tokens": 512,
+                    "total_tokens": 556,
+                    "output_tokens_details": { "reasoning_tokens": 348 },
+                },
+            },
+        });
+
+        let sse = format!("event: response.completed\ndata: {raw}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Err(ApiError::Stream(message)) => {
+                assert!(
+                    message.contains("max_output_tokens"),
+                    "truncation reason must survive: {message}"
+                );
+                assert!(
+                    message.contains("512"),
+                    "the output-token count is what identifies a max-token cap: {message}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// The overwhelmingly common case: status "completed" must stay a normal
+    /// completion, truncation check or not.
+    #[tokio::test]
+    async fn completed_event_with_completed_status_is_not_an_error() {
+        let raw = json!({
+            "type": "response.completed",
+            "sequence_number": 4,
+            "response": {
+                "id": "resp_ok",
+                "object": "response",
+                "status": "completed",
+                "incomplete_details": null,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "total_tokens": 30,
+                },
+            },
+        });
+
+        let sse = format!("event: response.completed\ndata: {raw}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Ok(ResponseEvent::Completed { response_id, .. }) => {
+                assert_eq!(response_id, "resp_ok");
             }
             other => panic!("unexpected event: {other:?}"),
         }
