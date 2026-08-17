@@ -1571,3 +1571,56 @@ async fn live_app_server_thread_closed_requests_immediate_exit() {
 
     assert_matches!(rx.try_recv(), Ok(AppEvent::Exit(ExitMode::Immediate)));
 }
+
+#[tokio::test]
+async fn context_compaction_started_announces_progress() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    drain_insert_history(&mut rx);
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+            item: AppServerThreadItem::ContextCompaction {
+                id: "compaction-1".to_string(),
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    // Compaction streams no deltas; without this announcement the UI is silent for as long as
+    // the summarization takes, which reads as a hang.
+    let rendered = drain_insert_history(&mut rx)
+        .into_iter()
+        .map(|lines| lines_to_single_string(&lines))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Compacting context"),
+        "expected a compaction notice in history, got: {rendered}"
+    );
+
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), "Compacting context");
+}

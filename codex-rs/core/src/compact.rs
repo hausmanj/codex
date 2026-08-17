@@ -46,11 +46,13 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::ToolSpec;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 use futures::prelude::*;
 use tracing::error;
+use tracing::warn;
 
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
@@ -111,6 +113,7 @@ pub(crate) async fn build_compaction_initial_context(
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    tools: Arc<[ToolSpec]>,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -130,6 +133,7 @@ pub(crate) async fn run_inline_auto_compact_task(
     run_compact_task_inner(
         sess,
         turn_context,
+        tools,
         input,
         initial_context_injection,
         CompactionTrigger::Auto,
@@ -156,6 +160,9 @@ pub(crate) async fn run_compact_task(
     run_compact_task_inner(
         sess.clone(),
         turn_context,
+        // The manual `/compact` turn is not bound to a sampling step, so there is no finalized
+        // tool plan to mirror here.
+        Arc::from(Vec::new()),
         input,
         InitialContextInjection::DoNotInject,
         CompactionTrigger::Manual,
@@ -169,6 +176,7 @@ pub(crate) async fn run_compact_task(
 async fn run_compact_task_inner(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    tools: Arc<[ToolSpec]>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
@@ -205,6 +213,7 @@ async fn run_compact_task_inner(
     let result = run_compact_task_inner_impl(
         Arc::clone(&sess),
         Arc::clone(&turn_context),
+        tools,
         input,
         initial_context_injection,
         compaction_metadata,
@@ -240,6 +249,7 @@ async fn run_compact_task_inner(
 async fn run_compact_task_inner_impl(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
+    tools: Arc<[ToolSpec]>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
     compaction_metadata: CompactionTurnMetadata,
@@ -268,86 +278,111 @@ async fn run_compact_task_inner_impl(
         )
         .await;
 
-    loop {
-        // Clone is required because of the loop
-        let turn_input = history
-            .clone()
-            .for_prompt(&turn_context.model_info.input_modalities);
-        let turn_input_len = turn_input.len();
-        let prompt = Prompt {
-            input: turn_input,
-            base_instructions: sess.get_base_instructions().await,
-            ..Default::default()
-        };
-        let attempt_result = drain_to_completed(
-            &sess,
-            turn_context.as_ref(),
-            &mut client_session,
-            &responses_metadata,
-            &prompt,
-        )
-        .await;
+    // Mirror the surrounding conversation's tool plan on the compaction request.
+    //
+    // Local runtimes (LM Studio, llama.cpp) render the tool list into the prompt prefix, so
+    // sending no tools makes this request diverge from every other request in the thread at
+    // token zero and forfeits the KV prefix cache: the whole context is prefilled from scratch.
+    // Measured against qwen3.8-27b, an otherwise identical request reused 0% of the cache
+    // without tools and ~99% with them, which on a full window is the difference between a
+    // multi-minute stall and a few seconds.
+    let mut request_tools = tools;
+    let summary_suffix = loop {
+        loop {
+            // Clone is required because of the loop
+            let turn_input = history
+                .clone()
+                .for_prompt(&turn_context.model_info.input_modalities);
+            let turn_input_len = turn_input.len();
+            let prompt = Prompt {
+                input: turn_input,
+                tools: Arc::clone(&request_tools),
+                // Match the sampling request's value so the request bodies stay comparable.
+                parallel_tool_calls: !request_tools.is_empty(),
+                base_instructions: sess.get_base_instructions().await,
+                ..Default::default()
+            };
+            let attempt_result = drain_to_completed(
+                &sess,
+                turn_context.as_ref(),
+                &mut client_session,
+                &responses_metadata,
+                &prompt,
+            )
+            .await;
 
-        match attempt_result {
-            Ok(()) => {
-                break;
-            }
-            Err(err)
-                if matches!(
-                    err.details(),
-                    CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
-                ) =>
-            {
-                return Err(err);
-            }
-            Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                return Err(e);
-            }
-            Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
-                if turn_input_len > 1 {
-                    // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
-                    error!(
-                        "Context window exceeded while compacting; removing oldest history item. Error: {e}"
-                    );
-                    history.remove_first_item();
-                    retries = 0;
-                    continue;
+            match attempt_result {
+                Ok(()) => {
+                    break;
                 }
-                sess.set_total_tokens_full(turn_context.as_ref()).await;
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                return Err(e);
-            }
-            Err(e) => {
-                if retries < max_retries {
-                    retries += 1;
-                    let delay = backoff(retries);
-                    sess.notify_stream_error(
-                        turn_context.as_ref(),
-                        format!("Reconnecting... {retries}/{max_retries}"),
-                        e,
-                    )
-                    .await;
-                    tokio::time::sleep(delay).await;
-                    continue;
-                } else {
+                Err(err)
+                    if matches!(
+                        err.details(),
+                        CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+                    ) =>
+                {
+                    return Err(err);
+                }
+                Err(e) if matches!(e.details(), CodexErrorDetails::SessionBudgetExceeded) => {
                     sess.track_turn_codex_error(turn_context.as_ref(), &e);
                     let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
                     sess.send_event(&turn_context, event).await;
                     return Err(e);
                 }
+                Err(e) if matches!(e.details(), CodexErrorDetails::ContextWindowExceeded) => {
+                    if turn_input_len > 1 {
+                        // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
+                        error!(
+                            "Context window exceeded while compacting; removing oldest history item. Error: {e}"
+                        );
+                        history.remove_first_item();
+                        retries = 0;
+                        continue;
+                    }
+                    sess.set_total_tokens_full(turn_context.as_ref()).await;
+                    sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                    let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                    sess.send_event(&turn_context, event).await;
+                    return Err(e);
+                }
+                Err(e) => {
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = backoff(retries);
+                        sess.notify_stream_error(
+                            turn_context.as_ref(),
+                            format!("Reconnecting... {retries}/{max_retries}"),
+                            e,
+                        )
+                        .await;
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    } else {
+                        sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                        let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                        sess.send_event(&turn_context, event).await;
+                        return Err(e);
+                    }
+                }
             }
         }
-    }
+
+        let suffix = get_last_assistant_message_from_turn(sess.clone_history().await.raw_items())
+            .unwrap_or_default();
+        if !suffix.trim().is_empty() || request_tools.is_empty() {
+            break suffix;
+        }
+
+        // Advertising tools means the model may answer with a tool call instead of a summary.
+        // An empty summary would silently discard the entire thread, so fall back to the
+        // tool-free request that can only produce prose.
+        warn!("compaction produced no summary text with tools advertised; retrying without tools");
+        request_tools = Arc::from(Vec::new());
+        retries = 0;
+    };
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
-    let summary_suffix =
-        get_last_assistant_message_from_turn(history_snapshot.raw_items()).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
     let user_messages = collect_annotated_user_messages(history_items);
 
