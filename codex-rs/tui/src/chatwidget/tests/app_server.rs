@@ -1669,3 +1669,76 @@ async fn context_compaction_started_announces_progress() {
     );
     assert!(chat.compaction_progress.is_none());
 }
+
+/// A local model can spend many minutes inside a `<think>` block before writing
+/// anything. `ReasoningTextDelta` is dropped unless `show_raw_agent_reasoning` is
+/// on, so without this the status line reads only `Working (14m 11s)` for the
+/// whole run and there is no way to tell a thinking model from a wedged one.
+#[tokio::test]
+async fn reasoning_deltas_drive_the_status_line_when_raw_reasoning_is_hidden() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.show_raw_agent_reasoning = false;
+
+    chat.handle_server_notification(
+        ServerNotification::TurnStarted(TurnStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: AppServerTurn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: AppServerTurnStatus::InProgress,
+                error: None,
+                started_at: Some(0),
+                completed_at: None,
+                duration_ms: None,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+    drain_insert_history(&mut rx);
+
+    // Before the first token there is nothing to count, and on a local model
+    // that gap is prompt processing -- it gets its own message.
+    let details = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible")
+        .details()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        details.contains("first token"),
+        "the pre-token wait should be named, got: {details}"
+    );
+
+    for delta in ["Checking the album", " repository for duplicates"] {
+        chat.handle_server_notification(
+            ServerNotification::ReasoningTextDelta(
+                codex_app_server_protocol::ReasoningTextDeltaNotification {
+                    thread_id: "thread-1".to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "reasoning-1".to_string(),
+                    delta: delta.to_string(),
+                    content_index: 0,
+                },
+            ),
+            /*replay_kind*/ None,
+        );
+    }
+
+    let details = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible")
+        .details()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        details.contains("tokens") && details.contains("duplicates"),
+        "hidden reasoning must still show as motion on the status line, got: {details}"
+    );
+    assert!(
+        drain_insert_history(&mut rx).is_empty(),
+        "raw reasoning must stay out of the transcript when it is hidden"
+    );
+}
