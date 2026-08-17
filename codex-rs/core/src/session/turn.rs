@@ -284,6 +284,10 @@ pub(crate) async fn run_turn(
 
     let mut last_agent_message: Option<String> = None;
     let mut stop_hook_active = false;
+    // How many times a single turn may resample after the model returns an
+    // empty completion with no tool call before the turn gives up.
+    const MAX_EMPTY_COMPLETION_RETRIES: u32 = 1;
+    let mut empty_completion_retries: u32 = 0;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -495,6 +499,46 @@ pub(crate) async fn run_turn(
                     }
                     can_drain_pending_input = !model_needs_follow_up;
                     continue;
+                }
+
+                // A sampling request can come back with an empty assistant
+                // message and no tool call. Nothing is wrong with the turn —
+                // there is simply nothing in it — so the loop exits, the TUI
+                // reprints the last real message, and the user sees a duplicated
+                // preamble followed by a dead turn. Local models on an
+                // unconstrained decoder do this regularly; a plain resample is
+                // usually productive, so retry once and, if it stalls again, say
+                // so rather than completing in silence.
+                let completion_is_empty = !needs_follow_up
+                    && sampling_request_last_agent_message
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty);
+                if completion_is_empty {
+                    if empty_completion_retries < MAX_EMPTY_COMPLETION_RETRIES {
+                        empty_completion_retries += 1;
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            attempt = empty_completion_retries,
+                            "model returned an empty completion with no tool call; resampling"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        turn_id = %turn_context.sub_id,
+                        "model returned an empty completion again after resampling; ending turn"
+                    );
+                    sess.send_event(
+                        &turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: "The model returned an empty response twice in a row and the \
+                                      turn ended with no answer. Send the request again."
+                                .to_string(),
+                        }),
+                    )
+                    .await;
+                } else {
+                    empty_completion_retries = 0;
                 }
 
                 if !needs_follow_up {
