@@ -400,6 +400,8 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    produced_output,
+                    saw_blank_message,
                 } = sampling_request_output;
                 if model_needs_follow_up {
                     sess.input_queue
@@ -509,11 +511,12 @@ pub(crate) async fn run_turn(
                 // unconstrained decoder do this regularly; a plain resample is
                 // usually productive, so retry once and, if it stalls again, say
                 // so rather than completing in silence.
-                let completion_is_empty = !needs_follow_up
-                    && sampling_request_last_agent_message
-                        .as_deref()
-                        .map(str::trim)
-                        .is_none_or(str::is_empty);
+                // Keyed on the response having contained nothing at all, not on
+                // the absence of an assistant message. Plenty of ordinary
+                // responses end with no message -- a reasoning item and nothing
+                // else, or a queued-mail turn -- and treating those as stalls
+                // resampled them into a loop.
+                let completion_is_empty = !needs_follow_up && !produced_output && saw_blank_message;
                 if completion_is_empty {
                     if empty_completion_retries < MAX_EMPTY_COMPLETION_RETRIES {
                         empty_completion_retries += 1;
@@ -1621,6 +1624,33 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    /// Whether the response contained anything at all: a tool call, a reasoning
+    /// item, or a message with text.
+    produced_output: bool,
+    /// Whether the response contained a message item whose text was blank. This
+    /// is what a truncated local generation looks like, and it is distinct from
+    /// a response with no items at all, which is an ordinary way for a turn to
+    /// end and must not be resampled.
+    saw_blank_message: bool,
+}
+
+/// Whether a completed output item represents real model output.
+///
+/// Only a message whose every content part is blank counts as nothing. A
+/// reasoning item is output even when the turn ends right after it, and so is a
+/// tool call -- which is why "the turn produced no assistant message" is far too
+/// broad a test for an empty response.
+fn response_item_carries_output(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|part| match part {
+            ContentItem::OutputText { text } | ContentItem::InputText { text } => {
+                !text.trim().is_empty()
+            }
+            _ => true,
+        }),
+        ResponseItem::Other => false,
+        _ => true,
+    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2278,6 +2308,8 @@ async fn try_run_sampling_request(
     const PREEMPT_CHECK_EVERY_EVENTS: u32 = 16;
     let mut preempt_check_countdown: u32 = PREEMPT_CHECK_EVERY_EVENTS;
     let mut streaming_tool_call = false;
+    let mut produced_output = false;
+    let mut saw_blank_message = false;
     let preempt_on_user_input = turn_context
         .config
         .features
@@ -2384,6 +2416,8 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        produced_output,
+                        saw_blank_message,
                     });
                 }
             }
@@ -2425,6 +2459,11 @@ async fn try_run_sampling_request(
                     && let Ok(Some(event)) = consumer.finish()
                 {
                     sess.send_event(&turn_context, event).await;
+                }
+                if response_item_carries_output(&item) {
+                    produced_output = true;
+                } else if matches!(item, ResponseItem::Message { .. }) {
+                    saw_blank_message = true;
                 }
                 let previously_active_item = active_item.take();
                 let previously_streamed_item = if active_item_is_streaming_to_client {
@@ -2511,6 +2550,8 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        produced_output,
+                        saw_blank_message,
                     });
                 }
             }
@@ -2691,6 +2732,8 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    produced_output,
+                    saw_blank_message,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
