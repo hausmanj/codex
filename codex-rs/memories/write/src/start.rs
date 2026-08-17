@@ -19,8 +19,17 @@ use tracing::warn;
 
 /// Starts the asynchronous startup memory pipeline for an eligible root session.
 ///
-/// The pipeline is skipped for ephemeral sessions, disabled feature flags, and
-/// subagent sessions.
+/// The pipeline is skipped for ephemeral sessions, disabled feature flags,
+/// subagent sessions, and sessions that opted out of memory generation.
+///
+/// `memories.generate_memories = false` makes this session read-only with
+/// respect to memories: it still consumes `memory_summary.md` through the read
+/// path, but neither harvests its own threads nor anyone else's. This matters
+/// for providers that cannot satisfy the pipeline's requirements — stage 1
+/// demands strict JSON-schema output, and a local runtime without constrained
+/// decoding fails every job. Without this check the flag only stamps new
+/// threads `memory_mode = 'disabled'`, leaving the session to burn its provider
+/// on rollouts other profiles created.
 pub fn start_memories_startup_task(
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
@@ -32,6 +41,7 @@ pub fn start_memories_startup_task(
 ) {
     if config.ephemeral
         || !config.features.enabled(Feature::MemoryTool)
+        || !config.memories.generate_memories
         || source.is_non_root_agent()
     {
         return;
