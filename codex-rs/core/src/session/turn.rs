@@ -2272,6 +2272,16 @@ async fn try_run_sampling_request(
         FuturesOrdered::new();
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
+    // Checking for pending input takes two async locks, so it is amortized over
+    // a run of stream events rather than paid on every delta. Deltas arrive many
+    // times a second, so this still reacts well inside a second.
+    const PREEMPT_CHECK_EVERY_EVENTS: u32 = 16;
+    let mut preempt_check_countdown: u32 = PREEMPT_CHECK_EVERY_EVENTS;
+    let mut streaming_tool_call = false;
+    let preempt_on_user_input = turn_context
+        .config
+        .features
+        .enabled(Feature::PreemptOnUserInput);
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -2336,6 +2346,60 @@ async fn try_run_sampling_request(
             .session_telemetry
             .record_responses(&handle_responses, &event);
         record_turn_ttft_metric(&turn_context, &event).await;
+
+        // Typing must not wait for the model to finish talking.
+        //
+        // Pending input is otherwise only drained between sampling requests, so
+        // a message typed during a long generation sits untouched until the
+        // whole request and its tool calls complete -- on a local model that can
+        // be twenty minutes, which reads as the UI ignoring the user. Cut the
+        // stream at the next delta instead and let the turn loop pick the input
+        // up, which is what interrupt-then-resend does by hand today.
+        //
+        // Off by default, and deliberately so: the default contract (see
+        // `user_input_does_not_preempt_after_reasoning_item`) is that a response
+        // which has already committed to a tool call and an answer gets to
+        // finish, because discarding it throws away real work. That is the right
+        // trade when responses complete promptly and the wrong one when a single
+        // response runs for twenty minutes.
+        //
+        // Two guards still apply when it is on. Never preempt once a tool call
+        // has started streaming -- a truncated call would be recorded as if it
+        // were complete -- and never while tools are still running. Mailbox mail
+        // is excluded (see `has_pending_user_input`); it is already handled at
+        // output-item boundaries below.
+        if preempt_on_user_input && !streaming_tool_call && in_flight.is_empty() {
+            preempt_check_countdown = preempt_check_countdown.saturating_sub(1);
+            if preempt_check_countdown == 0 {
+                preempt_check_countdown = PREEMPT_CHECK_EVERY_EVENTS;
+                if sess
+                    .input_queue
+                    .has_pending_user_input(&sess.active_turn)
+                    .await
+                {
+                    tracing::info!(
+                        turn_id = %turn_context.sub_id,
+                        "preempting in-flight generation: user input is waiting"
+                    );
+                    break Ok(SamplingRequestResult {
+                        needs_follow_up: true,
+                        last_agent_message,
+                    });
+                }
+            }
+        }
+
+        if matches!(
+            event,
+            ResponseEvent::ToolCallInputDelta { .. }
+                | ResponseEvent::OutputItemAdded(
+                    ResponseItem::FunctionCall { .. }
+                        | ResponseItem::CustomToolCall { .. }
+                        | ResponseItem::LocalShellCall { .. }
+                )
+        ) {
+            streaming_tool_call = true;
+        }
 
         match event {
             ResponseEvent::Created => {}
