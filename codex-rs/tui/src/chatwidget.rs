@@ -298,6 +298,7 @@ use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::custom_prompt_view::CustomPromptView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
+use crate::chatwidget::tool_lifecycle::CompactionProgress;
 use crate::clipboard_paste::paste_image_to_temp_png;
 use crate::collaboration_modes;
 use crate::diff_render::display_path_for;
@@ -614,6 +615,11 @@ pub(crate) struct ChatWidget {
     turn_lifecycle: TurnLifecycleState,
     safety_buffering: SafetyBufferingState,
     task_complete_pending: bool,
+    /// Live progress for an in-flight compaction, or `None` when compaction is not running.
+    ///
+    /// Compaction streams reasoning/summary deltas but must not write them to the transcript,
+    /// so they are accumulated here and surfaced through the status indicator instead.
+    compaction_progress: Option<CompactionProgress>,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     /// Tracks per-server MCP startup state while startup is in progress.
     ///

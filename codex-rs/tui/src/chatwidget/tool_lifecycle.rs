@@ -29,21 +29,52 @@ impl ChatWidget {
 
     /// Announces that compaction has started.
     ///
-    /// Compaction streams no deltas, so without this the UI is completely silent from the moment
-    /// compaction begins until the replacement history lands. On a local model summarizing a full
-    /// context window that gap can run for many minutes, which reads as a hang and invites the
-    /// user to interrupt a turn that is in fact making progress.
+    /// Compaction never writes to the transcript while it runs, so without this the UI is
+    /// completely silent from the moment compaction begins until the replacement history lands.
+    /// On a local model summarizing a full context window that gap can run for minutes, which
+    /// reads as a hang and invites the user to interrupt a turn that is in fact making progress.
     pub(super) fn on_context_compaction_begin(&mut self) {
         self.flush_answer_stream_with_separator();
         self.add_to_history(history_cell::new_info_event(
             "Compacting context".to_string(),
             Some("summarizing the thread to free up context; this can take a while".to_string()),
         ));
+        self.compaction_progress = Some(CompactionProgress::default());
         if self.bottom_pane.is_task_running() {
             self.bottom_pane.ensure_status_indicator();
         }
-        self.set_status_header(String::from("Compacting context"));
+        self.render_compaction_progress();
         self.request_redraw();
+    }
+
+    /// Records a chunk of the compaction stream and refreshes the status line.
+    ///
+    /// The summary itself is internal bookkeeping, so it is deliberately kept out of the
+    /// transcript; the user needs evidence of forward motion, not the text.
+    pub(super) fn on_context_compaction_progress(&mut self, delta: &str) {
+        let Some(progress) = self.compaction_progress.as_mut() else {
+            return;
+        };
+        progress.record(delta);
+        self.render_compaction_progress();
+    }
+
+    /// Clears compaction progress once the replacement history has landed.
+    pub(super) fn on_context_compaction_end(&mut self) {
+        self.compaction_progress = None;
+    }
+
+    fn render_compaction_progress(&mut self) {
+        let details = self
+            .compaction_progress
+            .as_ref()
+            .map(CompactionProgress::status_details);
+        self.set_status(
+            String::from("Compacting context"),
+            details,
+            StatusDetailsCapitalization::Preserve,
+            STATUS_DETAILS_DEFAULT_MAX_LINES,
+        );
     }
 
     pub(super) fn on_image_generation_end(
@@ -290,6 +321,49 @@ impl ChatWidget {
             item @ ThreadItem::FileChange { .. } => self.handle_file_change_completed_now(item),
             item @ ThreadItem::McpToolCall { .. } => self.handle_mcp_tool_call_completed_now(item),
             _ => {}
+        }
+    }
+}
+
+/// Accumulated progress for an in-flight compaction.
+///
+/// Tracks only what the status line needs: how much the model has produced so far and the tail
+/// of that output, so a long summarization reads as active work rather than a frozen UI.
+#[derive(Default)]
+pub(super) struct CompactionProgress {
+    approx_chars: usize,
+    tail: String,
+}
+
+/// Characters of streamed output kept for the status line.
+const COMPACTION_TAIL_CHARS: usize = 160;
+
+/// Rough characters-per-token ratio. This drives a progress readout, not accounting, so a
+/// cheap approximation is sufficient and avoids pulling a tokenizer into the TUI.
+const COMPACTION_CHARS_PER_TOKEN: usize = 4;
+
+impl CompactionProgress {
+    fn record(&mut self, delta: &str) {
+        self.approx_chars = self.approx_chars.saturating_add(delta.chars().count());
+        self.tail.push_str(&delta.replace('\n', " "));
+        // Keep the buffer bounded; a summary can run to thousands of tokens.
+        let excess = self
+            .tail
+            .chars()
+            .count()
+            .saturating_sub(COMPACTION_TAIL_CHARS);
+        if excess > 0 {
+            self.tail = self.tail.chars().skip(excess).collect();
+        }
+    }
+
+    fn status_details(&self) -> String {
+        let approx_tokens = self.approx_chars / COMPACTION_CHARS_PER_TOKEN;
+        let tail = self.tail.trim();
+        if tail.is_empty() {
+            format!("~{approx_tokens} tokens generated")
+        } else {
+            format!("~{approx_tokens} tokens · {tail}")
         }
     }
 }

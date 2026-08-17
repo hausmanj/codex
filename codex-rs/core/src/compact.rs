@@ -42,6 +42,7 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RawResponseCompletedEvent;
+use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -255,6 +256,9 @@ async fn run_compact_task_inner_impl(
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    // Progress deltas are attributed to the compaction item so the UI can route them to the
+    // compaction status instead of the transcript.
+    let compaction_item_id = compaction_item.id();
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
@@ -308,6 +312,7 @@ async fn run_compact_task_inner_impl(
                 &mut client_session,
                 &responses_metadata,
                 &prompt,
+                &compaction_item_id,
             )
             .await;
 
@@ -757,6 +762,7 @@ async fn drain_to_completed(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
+    progress_item_id: &str,
 ) -> CodexResult<()> {
     let mut stream = client_session
         .stream(
@@ -789,6 +795,26 @@ async fn drain_to_completed(
             }
             Ok(ResponseEvent::RateLimits(snapshot)) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
+            }
+            // Forward the summarization stream so the UI can show that compaction is making
+            // progress. Without this the whole compaction is silent: on a local model the
+            // summary can take minutes to generate, which is indistinguishable from a hang.
+            // Reasoning deltas matter as much as text here — a thinking model can spend its
+            // entire output budget reasoning before it emits a single character of summary.
+            Ok(ResponseEvent::OutputTextDelta(delta))
+            | Ok(ResponseEvent::ReasoningContentDelta { delta, .. })
+            | Ok(ResponseEvent::ReasoningSummaryDelta { delta, .. }) => {
+                sess.send_event(
+                    turn_context,
+                    EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
+                        thread_id: sess.thread_id.to_string(),
+                        turn_id: turn_context.sub_id.clone(),
+                        item_id: progress_item_id.to_string(),
+                        delta,
+                        summary_index: 0,
+                    }),
+                )
+                .await;
             }
             Ok(ResponseEvent::Completed {
                 response_id,
