@@ -5,10 +5,12 @@ use crossterm::event::KeyModifiers;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use std::sync::Arc;
 use tokio::sync::mpsc::unbounded_channel;
 
 use super::StartupDraftInitialScreen;
 use super::StartupDraftPump;
+use super::StartupDraftSessionAction;
 use super::handle_startup_draft_key;
 use super::startup_draft_bottom_pane;
 use super::startup_draft_renderable;
@@ -16,6 +18,7 @@ use super::startup_session_header;
 use crate::app_event_sender::AppEventSender;
 use crate::legacy_core::config::ConfigBuilder;
 use crate::render::renderable::Renderable;
+use crate::resume_picker::SessionSelection;
 use crate::tui::FrameRequester;
 use crate::tui::TuiEvent;
 
@@ -34,6 +37,7 @@ where
         events: Box::pin(futures::stream::iter(events)),
         app_event_rx: rx,
         initial_screen: StartupDraftInitialScreen::Composer,
+        session_action: StartupDraftSessionAction::New,
         pending_paste_newline: None,
     }
 }
@@ -43,14 +47,43 @@ fn startup_draft_renders_full_empty_and_multiline_composer_frames() {
     let mut pump = startup_test_pump(std::iter::empty());
     let mut snapshots = Vec::new();
 
-    for (label, width, text) in [
-        ("empty", 48, ""),
-        ("multiline", 48, "first startup line\nsecond startup line"),
-        ("narrow", 18, "first startup line\nsecond startup line"),
+    for (label, width, text, session_action) in [
+        ("empty", 48, "", StartupDraftSessionAction::New),
+        ("resuming", 48, "", StartupDraftSessionAction::Resume),
+        (
+            "forking",
+            48,
+            "draft while loading",
+            StartupDraftSessionAction::Fork,
+        ),
+        (
+            "multiline",
+            48,
+            "first startup line\nsecond startup line",
+            StartupDraftSessionAction::New,
+        ),
+        (
+            "narrow",
+            18,
+            "first startup line\nsecond startup line",
+            StartupDraftSessionAction::New,
+        ),
     ] {
+        pump.session_action = session_action;
         pump.bottom_pane
             .set_composer_text(text.to_string(), Vec::new(), Vec::new());
-        let renderable = startup_draft_renderable(&pump.header, &pump.bottom_pane);
+        let renderable =
+            startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action);
+        assert_eq!(
+            renderable.desired_height(width),
+            startup_draft_renderable(
+                &pump.header,
+                &pump.bottom_pane,
+                StartupDraftSessionAction::New,
+            )
+            .desired_height(width),
+            "loading status should reuse the existing gap above the composer"
+        );
         let area = Rect::new(
             /*x*/ 0,
             /*y*/ 0,
@@ -85,6 +118,93 @@ fn startup_draft_renders_full_empty_and_multiline_composer_frames() {
 }
 
 #[tokio::test]
+async fn startup_draft_clears_loading_status_when_starting_fresh() {
+    let mut snapshots = Vec::new();
+    let render_frame = |pump: &StartupDraftPump| {
+        let width = 48;
+        let renderable =
+            startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action);
+        let area = Rect::new(
+            /*x*/ 0,
+            /*y*/ 0,
+            width,
+            renderable.desired_height(width),
+        );
+        let mut buffer = Buffer::empty(area);
+        renderable.render(area, &mut buffer);
+        (0..area.height)
+            .map(|row| {
+                (0..area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace(crate::version::CODEX_CLI_VERSION, "<VERSION>")
+    };
+
+    for (label, initial_screen, session_action) in [
+        (
+            "resume lookup fallback",
+            StartupDraftInitialScreen::Composer,
+            StartupDraftSessionAction::Resume,
+        ),
+        (
+            "fork lookup fallback",
+            StartupDraftInitialScreen::Composer,
+            StartupDraftSessionAction::Fork,
+        ),
+        (
+            "resume picker cancellation",
+            StartupDraftInitialScreen::SessionPicker,
+            StartupDraftSessionAction::Resume,
+        ),
+        (
+            "fork picker cancellation",
+            StartupDraftInitialScreen::SessionPicker,
+            StartupDraftSessionAction::Fork,
+        ),
+    ] {
+        let mut pump = startup_test_pump(std::iter::empty());
+        pump.initial_screen = initial_screen;
+        pump.session_action = session_action;
+        if initial_screen == StartupDraftInitialScreen::Composer {
+            pump.bottom_pane.insert_str("draft while loading");
+        }
+        let mut tui = crate::tui::test_support::make_test_tui().expect("create test terminal");
+        pump.show_initial_screen(&mut tui)
+            .expect("respect the initial composer or picker screen");
+        let before = if tui.terminal.viewport_area.is_empty() {
+            "hidden while picker owns input".to_string()
+        } else {
+            render_frame(&pump)
+        };
+
+        pump.update_session_selection(&mut tui, &SessionSelection::StartFresh)
+            .expect("clear the loading status after a fresh-session selection");
+        if initial_screen == StartupDraftInitialScreen::SessionPicker {
+            assert!(tui.terminal.viewport_area.is_empty());
+            pump.show(&mut tui)
+                .expect("reveal the fresh-session composer after the picker");
+        }
+        let after = render_frame(&pump);
+        assert!(!after.contains("Resuming session"));
+        assert!(!after.contains("Forking session"));
+        if initial_screen == StartupDraftInitialScreen::Composer {
+            assert_eq!(pump.bottom_pane.composer_text(), "draft while loading");
+        }
+        snapshots.push(format!("{label}:\nbefore:\n{before}\nafter:\n{after}"));
+    }
+
+    insta::assert_snapshot!(
+        "startup_draft_fresh_session_transitions",
+        snapshots.join("\n---\n")
+    );
+}
+
+#[tokio::test]
 async fn startup_draft_hydrates_its_header_without_moving_the_composer() {
     let codex_home = tempfile::tempdir().expect("create temporary Codex home");
     let config = ConfigBuilder::default()
@@ -95,7 +215,8 @@ async fn startup_draft_hydrates_its_header_without_moving_the_composer() {
     let mut pump = startup_test_pump(std::iter::empty());
     let width = 80;
     let initial_height =
-        startup_draft_renderable(&pump.header, &pump.bottom_pane).desired_height(width);
+        startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action)
+            .desired_height(width);
 
     assert_eq!(
         pump.header.raw_lines().last().map(ToString::to_string),
@@ -114,7 +235,8 @@ async fn startup_draft_hydrates_its_header_without_moving_the_composer() {
         Some(expected_directory)
     );
     assert_eq!(
-        startup_draft_renderable(&pump.header, &pump.bottom_pane).desired_height(width),
+        startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action)
+            .desired_height(width),
         initial_height
     );
 }
@@ -362,10 +484,11 @@ fn startup_draft_allows_local_editor_shortcuts_without_startup_actions() {
     assert_eq!(pump.bottom_pane.composer_text(), "first ");
 
     let mut keymap = crate::keymap::RuntimeKeymap::defaults();
-    keymap.editor.move_line_start = vec![crate::key_hint::ctrl(KeyCode::Char('z'))];
-    keymap.editor.move_line_end = vec![crate::key_hint::ctrl(KeyCode::Char('v'))];
-    keymap.editor.move_left = vec![crate::key_hint::ctrl(KeyCode::Char('s'))];
-    keymap.editor.insert_newline = vec![crate::key_hint::plain(KeyCode::Enter)];
+    let editor = Arc::make_mut(&mut keymap.editor);
+    editor.move_line_start = vec![crate::key_hint::ctrl(KeyCode::Char('z'))];
+    editor.move_line_end = vec![crate::key_hint::ctrl(KeyCode::Char('v'))];
+    editor.move_left = vec![crate::key_hint::ctrl(KeyCode::Char('s'))];
+    editor.insert_newline = vec![crate::key_hint::plain(KeyCode::Enter)];
     keymap.composer.submit = vec![crate::key_hint::ctrl(KeyCode::Char('s'))];
     pump.bottom_pane.set_keymap_bindings(&keymap);
     handle_startup_draft_key(
@@ -558,7 +681,7 @@ async fn startup_draft_waits_for_onboarding_before_accepting_input() {
         .expect("show the composer after onboarding finishes");
     assert!(!tui.terminal.viewport_area.is_empty());
     let area = tui.terminal.viewport_area;
-    let renderable = startup_draft_renderable(&pump.header, &pump.bottom_pane);
+    let renderable = startup_draft_renderable(&pump.header, &pump.bottom_pane, pump.session_action);
     let mut buffer = Buffer::empty(area);
     renderable.render(area, &mut buffer);
     let visible_frame = (area.top()..area.bottom())

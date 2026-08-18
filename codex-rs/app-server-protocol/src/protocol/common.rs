@@ -612,6 +612,7 @@ client_request_definitions! {
     },
     ThreadMetadataUpdate => "thread/metadata/update" {
         params: v2::ThreadMetadataUpdateParams,
+        inspect_params: true,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadMetadataUpdateResponse,
     },
@@ -694,6 +695,48 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadListResponse,
     },
+    #[experimental("project/list")]
+    ProjectList => "project/list" {
+        params: v2::ProjectListParams,
+        serialization: global_shared_read("projects"),
+        response: v2::ProjectListResponse,
+    },
+    #[experimental("project/read")]
+    ProjectRead => "project/read" {
+        params: v2::ProjectReadParams,
+        serialization: global_shared_read("projects"),
+        response: v2::ProjectReadResponse,
+    },
+    #[experimental("project/create")]
+    ProjectCreate => "project/create" {
+        params: v2::ProjectCreateParams,
+        serialization: global("projects"),
+        response: v2::ProjectCreateResponse,
+    },
+    #[experimental("project/import")]
+    ProjectImport => "project/import" {
+        params: v2::ProjectImportParams,
+        serialization: global("projects"),
+        response: v2::ProjectImportResponse,
+    },
+    #[experimental("project/update")]
+    ProjectUpdate => "project/update" {
+        params: v2::ProjectUpdateParams,
+        serialization: global("projects"),
+        response: v2::ProjectUpdateResponse,
+    },
+    #[experimental("project/move")]
+    ProjectMove => "project/move" {
+        params: v2::ProjectMoveParams,
+        serialization: global("projects"),
+        response: v2::ProjectMoveResponse,
+    },
+    #[experimental("project/delete")]
+    ProjectDelete => "project/delete" {
+        params: v2::ProjectDeleteParams,
+        serialization: global("projects"),
+        response: v2::ProjectDeleteResponse,
+    },
     ThreadSectionList => "threadSection/list" {
         params: v2::ThreadSectionListParams,
         serialization: global_shared_read("thread-sections"),
@@ -769,7 +812,7 @@ client_request_definitions! {
     },
     HooksList => "hooks/list" {
         params: v2::HooksListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::HooksListResponse,
     },
     MarketplaceAdd => "marketplace/add" {
@@ -1267,7 +1310,7 @@ client_request_definitions! {
 
     ConfigRequirementsRead => "configRequirements/read" {
         params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::ConfigRequirementsReadResponse,
     },
 
@@ -1761,6 +1804,10 @@ server_notification_definitions! {
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
     #[experimental("thread/queue/changed")]
     ThreadQueueChanged => "thread/queue/changed" (v2::ThreadQueueChangedNotification),
+    #[experimental("project/changed")]
+    ProjectChanged => "project/changed" (v2::ProjectChangedNotification),
+    #[experimental("thread/project/updated")]
+    ThreadProjectUpdated => "thread/project/updated" (v2::ThreadProjectUpdatedNotification),
     #[experimental("thread/environment/connected")]
     EnvironmentConnected => "thread/environment/connected" (v2::EnvironmentConnectionNotification),
     #[experimental("thread/environment/disconnected")]
@@ -2198,6 +2245,15 @@ mod tests {
             Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
         );
 
+        let hooks_list = ClientRequest::HooksList {
+            request_id: request_id(),
+            params: v2::HooksListParams { cwds: Vec::new() },
+        };
+        assert_eq!(
+            hooks_list.serialization_scope(),
+            Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
+        );
+
         let skills_extra_roots_set = ClientRequest::SkillsExtraRootsSet {
             request_id: request_id(),
             params: v2::SkillsExtraRootsSetParams {
@@ -2290,6 +2346,15 @@ mod tests {
         };
         assert_eq!(
             config_read.serialization_scope(),
+            Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
+        );
+
+        let config_requirements_read = ClientRequest::ConfigRequirementsRead {
+            request_id: request_id(),
+            params: None,
+        };
+        assert_eq!(
+            config_requirements_read.serialization_scope(),
             Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
         );
 
@@ -2992,6 +3057,7 @@ mod tests {
                     ephemeral: true,
                     section: None,
                     section_entered_at: None,
+                    project_id: None,
                     history_mode: Default::default(),
                     model_provider: "openai".to_string(),
                     created_at: 1,
@@ -3046,6 +3112,7 @@ mod tests {
                         "ephemeral": true,
                         "section": null,
                         "sectionEnteredAt": null,
+                        "projectId": null,
                         "historyMode": "legacy",
                         "modelProvider": "openai",
                         "createdAt": 1,

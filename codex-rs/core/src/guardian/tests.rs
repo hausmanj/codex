@@ -1121,10 +1121,12 @@ fn guardian_approval_request_to_json_renders_mcp_tool_call_shape() -> serde_json
 async fn build_guardian_prompt_items_explains_node_repl_review_scope() -> anyhow::Result<()> {
     let (session, mut turn) =
         guardian_test_session_and_turn_with_base_url("http://localhost").await;
-    Arc::get_mut(&mut turn)
-        .expect("turn should be uniquely owned")
-        .model_info
-        .node_repl_auto_review_required = true;
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut turn)
+            .expect("turn should be uniquely owned")
+            .model_info,
+    )
+    .node_repl_auto_review_required = true;
     seed_guardian_parent_history(&session, &turn).await;
     let context = GuardianReviewContext::from(&turn);
 
@@ -1205,7 +1207,7 @@ async fn build_guardian_prompt_items_keeps_other_requests_generic() -> anyhow::R
 
 #[test]
 fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_json::Result<()> {
-    let cwd = test_path_buf("/repo").abs();
+    let cwd = PathUri::parse("file:///C:/repo").expect("valid Windows path URI");
     let action = GuardianApprovalRequest::NetworkAccess {
         id: "network-1".to_string(),
         turn_id: "turn-1".to_string(),
@@ -1217,7 +1219,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
             call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd: cwd.clone(),
+            cwd,
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
             additional_permissions: None,
             justification: Some("Fetch the release metadata.".to_string()),
@@ -1237,7 +1239,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
                 "callId": "call-1",
                 "toolName": "shell",
                 "command": ["curl", "https://example.com"],
-                "cwd": cwd.to_string_lossy().to_string(),
+                "cwd": "C:\\repo",
                 "sandboxPermissions": "use_default",
                 "justification": "Fetch the release metadata.",
             },
@@ -1251,7 +1253,7 @@ fn guardian_approval_request_to_json_renders_network_access_trigger() -> serde_j
 async fn build_guardian_prompt_items_explains_network_access_review_scope() -> anyhow::Result<()> {
     let (session, turn) = guardian_test_session_and_turn_with_base_url("http://localhost").await;
     seed_guardian_parent_history(&session, &turn).await;
-    let cwd = test_path_buf("/repo").abs();
+    let cwd = PathUri::from_abs_path(&test_path_buf("/repo").abs());
 
     let prompt = build_guardian_prompt_items(
         session.as_ref(),
@@ -1380,7 +1382,7 @@ fn guardian_request_target_item_id_omits_network_access_trigger_call_id() {
             call_id: "call-1".to_string(),
             tool_name: "shell".to_string(),
             command: vec!["curl".to_string(), "https://example.com".to_string()],
-            cwd: test_path_buf("/repo").abs(),
+            cwd: PathUri::from_abs_path(&test_path_buf("/repo").abs()),
             sandbox_permissions: crate::sandboxing::SandboxPermissions::UseDefault,
             additional_permissions: None,
             justification: None,
@@ -1700,7 +1702,7 @@ async fn guardian_request_model_for_auto_review(
     match catalog {
         GuardianTestCatalog::Bundled => {}
         GuardianTestCatalog::ParentOnly => {
-            let parent_model = turn.model_info.clone();
+            let parent_model = turn.model_info.as_ref().clone();
             let auth_manager = Arc::clone(&session.services.auth_manager);
             let models_manager = StaticModelsManager::new(
                 Some(auth_manager),
@@ -1714,10 +1716,12 @@ async fn guardian_request_model_for_auto_review(
                 .models_manager = Arc::new(models_manager);
         }
     }
-    Arc::get_mut(&mut turn)
-        .expect("turn should be unique")
-        .model_info
-        .auto_review_model_override = auto_review_model_override;
+    Arc::make_mut(
+        &mut Arc::get_mut(&mut turn)
+            .expect("turn should be unique")
+            .model_info,
+    )
+    .auto_review_model_override = auto_review_model_override;
     let parent_model = turn.model_info.slug.clone();
     let preferred_model = turn.provider.approval_review_preferred_model().to_string();
     let parent_turn_id = turn.sub_id.clone();
@@ -1942,7 +1946,8 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
     session.services.skills_service.clear_cache();
     turn.config = Arc::clone(&config);
     turn.provider = create_model_provider(config.model_provider.clone(), turn.auth_manager.clone());
-    turn.model_info.auto_review_model_override = Some("codex-auto-review".to_string());
+    Arc::make_mut(&mut turn.model_info).auto_review_model_override =
+        Some("codex-auto-review".to_string());
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     seed_guardian_parent_history(&session, &turn).await;
@@ -2186,7 +2191,8 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         .enable(Feature::GuardianReuseParentCompaction)
         .expect("Guardian parent-compaction reuse should be configurable");
     let turn_mut = Arc::get_mut(&mut turn).expect("turn should be unique");
-    turn_mut.model_info.auto_review_model_override = Some("codex-auto-review".to_string());
+    Arc::make_mut(&mut turn_mut.model_info).auto_review_model_override =
+        Some("codex-auto-review".to_string());
     turn_mut.config = Arc::new(config);
     seed_guardian_parent_history(&session, &turn).await;
 
@@ -3387,7 +3393,7 @@ async fn guardian_review_session_config_clears_context_overrides_for_distinct_ef
 async fn guardian_review_session_config_preserves_context_overrides_for_same_effective_model() {
     let server = start_mock_server().await;
     let (mut session, mut turn) = guardian_test_session_and_turn(&server).await;
-    let parent_model = turn.model_info.clone();
+    let parent_model = turn.model_info.as_ref().clone();
     let auth_manager = Arc::clone(&session.services.auth_manager);
     Arc::get_mut(&mut session)
         .expect("session should be unique")
