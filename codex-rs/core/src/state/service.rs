@@ -69,6 +69,9 @@ pub(crate) struct SessionServices {
     pub(crate) guardian_rejection_circuit_breaker: Mutex<GuardianRejectionCircuitBreaker>,
     /// No-progress circuit breaker for repeated unchanged tool calls (v2).
     pub(crate) repeat_call_guard: Mutex<crate::tools::repeat_guard::RepeatCallGuard>,
+    /// Latest `update_plan` state, used to continue a turn that ended with
+    /// plan steps outstanding while running unattended.
+    pub(crate) plan_progress: Mutex<crate::tools::plan_progress::PlanProgress>,
     pub(crate) runtime_handle: Handle,
     pub(crate) skills_service: Arc<HostSkillsService>,
     pub(crate) agents_md_manager: Arc<AgentsMdManager>,
