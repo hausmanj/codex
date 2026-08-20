@@ -580,7 +580,7 @@ mod tests {
         // Sixth call is blocked after five identical results.
         assert!(guard.check(&signature).is_some());
 
-        let mut clamped = RepeatCallGuard::new(1);
+        let clamped = RepeatCallGuard::new(1);
         assert_eq!(clamped.threshold, 2, "threshold must clamp to minimum 2");
     }
 
