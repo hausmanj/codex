@@ -316,6 +316,20 @@ pub struct RepeatGuardConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 2))]
     pub block_after_repeats: Option<u32>,
+    /// Maximum consecutive follow-up turns to auto-start when the guard blocks
+    /// a call and the model's turn ends without trying anything else
+    /// afterward, instead of leaving the session idle. 0 disables auto-nudging
+    /// (the guard still blocks; recovery is left entirely to the model/user).
+    /// The streak resets on genuine progress (a state-changing tool call).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_nudge_max: Option<u32>,
+    /// Seconds of active generation with no completed item before the turn is
+    /// cut and auto-nudged, same as a repeat-guard block. 0 disables this
+    /// check. The repeat guard alone cannot catch a stall that never reaches
+    /// a tool call at all -- a reasoning block that loops on itself and never
+    /// converges produces nothing for the guard to see repeat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_progress_timeout_secs: Option<u32>,
 }
 
 impl FeatureConfig for RepeatGuardConfigToml {

@@ -2295,6 +2295,23 @@ async fn try_run_sampling_request(
         .config
         .features
         .enabled(Feature::PreemptOnUserInput);
+    // No-progress watchdog: cut a generation that has produced zero completed
+    // items (no message, no tool call, nothing) for this many seconds. 0/unset
+    // disables it. Added after a confirmed 22-minute stall on the local
+    // profile where the rollout log showed a single generation producing
+    // nothing at all the entire time -- the repeat guard cannot see this,
+    // since it only tracks repeated *tool calls*, and a stall like this never
+    // reaches one (2026-08-18). Checked on the same amortized cadence as the
+    // preempt check above, since both are cheap per-check and deltas arrive
+    // many times a second.
+    let no_progress_timeout = turn_context
+        .config
+        .repeat_guard
+        .as_ref()
+        .map(|guard| guard.no_progress_timeout_secs)
+        .filter(|secs| *secs > 0)
+        .map(|secs| std::time::Duration::from_secs(u64::from(secs)));
+    let mut last_progress_at = std::time::Instant::now();
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
         String,
@@ -2381,14 +2398,19 @@ async fn try_run_sampling_request(
         // were complete -- and never while tools are still running. Mailbox mail
         // is excluded (see `has_pending_user_input`); it is already handled at
         // output-item boundaries below.
-        if preempt_on_user_input && !streaming_tool_call && in_flight.is_empty() {
+        // Both checks below are safe only at the same points preemption
+        // already restricts itself to: never mid-tool-call (a truncated call
+        // would be recorded as if it were complete) and never while tools are
+        // still running.
+        if !streaming_tool_call && in_flight.is_empty() {
             preempt_check_countdown = preempt_check_countdown.saturating_sub(1);
             if preempt_check_countdown == 0 {
                 preempt_check_countdown = PREEMPT_CHECK_EVERY_EVENTS;
-                if sess
-                    .input_queue
-                    .has_pending_user_input(&sess.active_turn)
-                    .await
+                if preempt_on_user_input
+                    && sess
+                        .input_queue
+                        .has_pending_user_input(&sess.active_turn)
+                        .await
                 {
                     tracing::info!(
                         turn_id = %turn_context.sub_id,
@@ -2400,6 +2422,22 @@ async fn try_run_sampling_request(
                         produced_output,
                         saw_blank_message,
                     });
+                }
+                if let Some(timeout) = no_progress_timeout
+                    && last_progress_at.elapsed() >= timeout
+                {
+                    tracing::warn!(
+                        target: "codex_core::no_progress_watchdog",
+                        turn_id = %turn_context.sub_id,
+                        elapsed_secs = last_progress_at.elapsed().as_secs(),
+                        "no-progress watchdog: cutting generation, zero completed items within timeout"
+                    );
+                    sess.services
+                        .repeat_call_guard
+                        .lock()
+                        .await
+                        .mark_no_progress_stall();
+                    break Err(CodexErr::TurnAborted);
                 }
             }
         }
@@ -2419,6 +2457,7 @@ async fn try_run_sampling_request(
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
+                last_progress_at = std::time::Instant::now();
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
                     let call_id = match &item {
