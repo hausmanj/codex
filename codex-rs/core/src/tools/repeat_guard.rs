@@ -66,6 +66,38 @@ pub struct RepeatCallGuard {
     insertion_order: Vec<String>,
     /// Identical-result observations required before the next call is blocked.
     threshold: u32,
+    /// Set when `check` blocks a call; cleared the moment any further tool
+    /// call executes (`record`) or genuine progress is observed
+    /// (`note_state_change`). If this is still set when the turn ends with no
+    /// further tool call at all, the model hit the guard and gave up without
+    /// trying anything else — see `take_stall_for_auto_nudge`.
+    blocked_without_followup: bool,
+    /// Set by `mark_no_progress_stall` when a turn is cut for producing no
+    /// completed item within the configured timeout. Independent of
+    /// `blocked_without_followup` -- this stall never touches the repeat-call
+    /// tracking at all, since it fires when the model never even reached a
+    /// tool call. See `take_stall_for_auto_nudge`.
+    no_progress_stall: bool,
+    /// Consecutive auto-nudges issued for this unresolved stall streak. Reset
+    /// to 0 on genuine progress (`note_state_change`), never by a mere retry.
+    /// Shared across both stall kinds -- either one counts toward the same
+    /// cap, since both mean the model isn't converging.
+    consecutive_nudges: u32,
+}
+
+/// Which condition produced the stall `take_stall_for_auto_nudge` reports.
+/// Selects the auto-nudge message text: the two failure modes look nothing
+/// alike from the model's side (one is a tool call it can see was blocked,
+/// the other is a reasoning turn that never reached a tool call at all), so
+/// telling the model which one happened is what makes the nudge actionable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallKind {
+    /// The guard blocked a repeated identical tool call and nothing else
+    /// followed before the turn ended.
+    RepeatedToolCall,
+    /// The turn was cut for producing no completed item within the
+    /// configured no-progress timeout.
+    NoProgress,
 }
 
 impl Default for RepeatCallGuard {
@@ -80,7 +112,30 @@ impl RepeatCallGuard {
             entries: HashMap::new(),
             insertion_order: Vec::new(),
             threshold: block_after_repeats.max(2),
+            blocked_without_followup: false,
+            no_progress_stall: false,
+            consecutive_nudges: 0,
         }
+    }
+
+    /// Marks the current stall streak as a no-progress timeout rather than a
+    /// blocked repeated call. Called from the turn loop when it cuts a
+    /// generation that produced no completed item within the configured
+    /// timeout -- see `RepeatGuardConfig::no_progress_timeout_secs`.
+    pub fn mark_no_progress_stall(&mut self) {
+        self.no_progress_stall = true;
+    }
+
+    /// Non-consuming peek at whether a no-progress stall is pending, without
+    /// touching the repeated-tool-call stall flag. Used only to let
+    /// `on_task_finished` auto-nudge even when the watchdog's own abort left
+    /// `idle_cause` as `Interrupted`/`Failed` rather than `Completed` --
+    /// deliberately narrower than a generic "any stall pending" peek, so it
+    /// cannot let a repeat-guard block ride along and auto-nudge after a
+    /// genuine user interrupt, which is exactly the case the `Completed`-only
+    /// gate exists to prevent for that stall kind.
+    pub fn has_no_progress_stall_pending(&self) -> bool {
+        self.no_progress_stall
     }
 
     /// Returns the model-facing block message when this invocation must not be
@@ -99,6 +154,7 @@ impl RepeatCallGuard {
                 reason = "identical result repeated with no intervening state change",
                 "repeat guard: blocking no-progress tool call"
             );
+            self.blocked_without_followup = true;
             Some(block_message())
         } else {
             None
@@ -109,6 +165,12 @@ impl RepeatCallGuard {
     /// stored count is how many identical results have been observed so far for
     /// this signature (the first observation stores 1).
     pub fn record(&mut self, signature: &str, result_hash: String) {
+        // Any tool call that actually ran — even a read-only one, even if it
+        // hits the guard again later — means the model is still trying
+        // something, not sitting stuck. Only "guard blocked, then nothing
+        // else happened before the turn ended" counts as a stall.
+        self.blocked_without_followup = false;
+        self.no_progress_stall = false;
         let repeat = match self.entries.get(signature) {
             Some(entry) if entry.last_result_hash == result_hash => {
                 entry.repeat_of_last_result.saturating_add(1)
@@ -136,13 +198,44 @@ impl RepeatCallGuard {
     }
 
     /// Records an intervening state change: clears all tracked history so the
-    /// next identical call is treated as fresh.
+    /// next identical call is treated as fresh, and resets the auto-nudge
+    /// streak since genuine progress restores trust.
     pub fn note_state_change(&mut self) {
         if !self.entries.is_empty() {
             tracing::debug!("repeat guard: state change observed, clearing history");
         }
         self.entries.clear();
         self.insertion_order.clear();
+        self.blocked_without_followup = false;
+        self.no_progress_stall = false;
+        self.consecutive_nudges = 0;
+    }
+
+    /// Called once per completing turn. Returns the stall kind exactly when:
+    /// a stall (blocked repeat, or a no-progress timeout) was recorded during
+    /// this turn, no further tool call followed (the model gave up rather
+    /// than pivoting), and the per-streak nudge cap (`max`, 0 = disabled) has
+    /// not been reached — in which case the caller should start a follow-up
+    /// turn nudging the model to pivot instead of leaving the session idle.
+    /// Always clears both pending-stall flags so a turn that merely repeats
+    /// the same block doesn't re-trigger without a fresh one. A repeated-call
+    /// block takes priority when (implausibly) both fired in the same turn,
+    /// since it carries more specific information for the nudge.
+    pub fn take_stall_for_auto_nudge(&mut self, max: u32) -> Option<StallKind> {
+        let blocked = std::mem::take(&mut self.blocked_without_followup);
+        let no_progress = std::mem::take(&mut self.no_progress_stall);
+        let kind = if blocked {
+            Some(StallKind::RepeatedToolCall)
+        } else if no_progress {
+            Some(StallKind::NoProgress)
+        } else {
+            None
+        };
+        if kind.is_none() || max == 0 || self.consecutive_nudges >= max {
+            return None;
+        }
+        self.consecutive_nudges += 1;
+        kind
     }
 
     /// Whether the flat tool name is one of the state-changing tools that should
@@ -314,6 +407,44 @@ fn block_message() -> String {
         .to_string()
 }
 
+/// Follow-up turn injected by `take_stall_for_auto_nudge` when the model hit
+/// the guard and then ended its turn without trying anything else. Shorter
+/// and more directive than `block_message`: the model already saw that text
+/// once and didn't act on it, so this leads with the outcome, not the
+/// mechanism.
+///
+/// `NoProgress` gets different wording on purpose: the model has no memory of
+/// what happened during the cut turn (it was mid-generation, not between
+/// steps), so telling it "you hit the guard" would be describing an event it
+/// never saw. Confirmed necessary 2026-08-18: a genuine 22-minute stall
+/// produced zero completed items the entire time, and the model's own
+/// after-the-fact account of what happened during it was fabricated (a
+/// stalled generation cannot observe itself) -- so this message says plainly
+/// that nothing is known about what happened, instead of inviting a guess.
+pub fn auto_nudge_message(kind: StallKind) -> String {
+    match kind {
+        StallKind::RepeatedToolCall => {
+            "You hit the repeat-tool-call guard on your last turn and stopped without \
+             taking a new action. Stop retrying the same command. In one sentence, \
+             state what you were trying to find or do and exactly what failed, then \
+             take ONE concrete, materially different next step right now — a \
+             different file, a different tool, or a direct question back to the user \
+             if you are genuinely blocked."
+                .to_string()
+        }
+        StallKind::NoProgress => {
+            "Your previous turn was cut off after running for several minutes without \
+             completing a single message or tool call. Nothing is known about what you \
+             were doing in there — do not guess or narrate a story about it, and do not \
+             cite your own prior reasoning as evidence of what happened. In one sentence, \
+             state what you are trying to accomplish right now based on the conversation \
+             so far, then take ONE concrete, small step toward it — a single tool call or \
+             a short direct answer, not another long uninterrupted stretch of reasoning."
+                .to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +582,145 @@ mod tests {
 
         let mut clamped = RepeatCallGuard::new(1);
         assert_eq!(clamped.threshold, 2, "threshold must clamp to minimum 2");
+    }
+
+    /// The core stall signal: guard blocks, then the turn ends with no further
+    /// tool call at all. This is what `on_task_finished` checks for.
+    #[test]
+    fn stall_is_flagged_when_block_is_the_last_action_in_the_turn() {
+        let mut guard = RepeatCallGuard::new(2);
+        let signature = sig("exec_command", "grep foo bar.dart");
+        guard.record(&signature, hash_result("true", "same"));
+        guard.record(&signature, hash_result("true", "same"));
+        assert!(guard.check(&signature).is_some(), "third call is blocked");
+
+        assert_eq!(
+            guard.take_stall_for_auto_nudge(3),
+            Some(StallKind::RepeatedToolCall),
+            "block with nothing after it must be a stall"
+        );
+    }
+
+    /// If the model tries anything else after the block — even a read-only,
+    /// even one that hits the guard again — it is not stalled: it's working.
+    #[test]
+    fn any_followup_tool_call_clears_the_stall() {
+        let mut guard = RepeatCallGuard::new(2);
+        let signature = sig("exec_command", "grep foo bar.dart");
+        guard.record(&signature, hash_result("true", "same"));
+        guard.record(&signature, hash_result("true", "same"));
+        assert!(guard.check(&signature).is_some());
+
+        // Model tries something different afterward.
+        let other_signature = sig("exec_command", "grep foo baz.dart");
+        guard.record(&other_signature, hash_result("true", "different"));
+
+        assert_eq!(
+            guard.take_stall_for_auto_nudge(3),
+            None,
+            "a followup call means it is not stalled, even though it was blocked earlier"
+        );
+    }
+
+    /// Genuine progress (a state-changing call) resets the nudge streak, not
+    /// just the stall flag — a model that got back on track shouldn't have a
+    /// stale nudge count held against it if it stalls again later.
+    #[test]
+    fn state_change_resets_the_nudge_streak() {
+        let mut guard = RepeatCallGuard::new(2);
+        let signature = sig("exec_command", "grep foo bar.dart");
+        for _ in 0..3 {
+            guard.record(&signature, hash_result("true", "same"));
+            guard.check(&signature);
+        }
+        assert!(guard.take_stall_for_auto_nudge(3).is_some());
+        assert_eq!(
+            guard.take_stall_for_auto_nudge(3),
+            None,
+            "already cleared, nothing to take"
+        );
+
+        // Force another stall, consume up to the cap.
+        for _ in 0..3 {
+            guard.record(&signature, hash_result("true", "same"));
+            guard.check(&signature);
+        }
+        guard.take_stall_for_auto_nudge(1); // consecutive_nudges now at cap (1)
+
+        guard.note_state_change();
+
+        for _ in 0..3 {
+            guard.record(&signature, hash_result("true", "same"));
+            guard.check(&signature);
+        }
+        assert!(
+            guard.take_stall_for_auto_nudge(1).is_some(),
+            "state change must reset the streak so a later stall can nudge again"
+        );
+    }
+
+    /// Cap enforcement: once `max` nudges have fired for an unresolved streak,
+    /// further stalls are reported as-is (not nudged again) until real
+    /// progress resets the streak.
+    #[test]
+    fn nudge_cap_stops_firing_after_max_consecutive_nudges() {
+        let mut guard = RepeatCallGuard::new(2);
+        let signature = sig("exec_command", "grep foo bar.dart");
+
+        for expected in [
+            Some(StallKind::RepeatedToolCall),
+            Some(StallKind::RepeatedToolCall),
+            None,
+        ] {
+            for _ in 0..3 {
+                guard.record(&signature, hash_result("true", "same"));
+                guard.check(&signature);
+            }
+            assert_eq!(guard.take_stall_for_auto_nudge(2), expected);
+        }
+    }
+
+    /// `max == 0` disables auto-nudging outright, even with an unresolved stall.
+    #[test]
+    fn zero_max_disables_auto_nudge() {
+        let mut guard = RepeatCallGuard::new(2);
+        let signature = sig("exec_command", "grep foo bar.dart");
+        for _ in 0..3 {
+            guard.record(&signature, hash_result("true", "same"));
+            guard.check(&signature);
+        }
+        assert_eq!(guard.take_stall_for_auto_nudge(0), None);
+    }
+
+    /// A no-progress timeout must be reported as its own kind, distinct from a
+    /// repeated-tool-call block, and must go through the same cap/streak
+    /// machinery.
+    #[test]
+    fn no_progress_stall_reports_its_own_kind_and_respects_the_cap() {
+        let mut guard = RepeatCallGuard::new(2);
+        guard.mark_no_progress_stall();
+        assert_eq!(
+            guard.take_stall_for_auto_nudge(3),
+            Some(StallKind::NoProgress)
+        );
+        // Cleared after taking; nothing left to report.
+        assert_eq!(guard.take_stall_for_auto_nudge(3), None);
+    }
+
+    /// A repeated-tool-call block takes priority if (implausibly) both stall
+    /// flags are set at once, since it carries more specific information.
+    #[test]
+    fn repeated_call_block_takes_priority_over_no_progress_when_both_are_set() {
+        let mut guard = RepeatCallGuard::new(2);
+        let signature = sig("exec_command", "grep foo bar.dart");
+        guard.record(&signature, hash_result("true", "same"));
+        guard.record(&signature, hash_result("true", "same"));
+        assert!(guard.check(&signature).is_some());
+        guard.mark_no_progress_stall();
+        assert_eq!(
+            guard.take_stall_for_auto_nudge(3),
+            Some(StallKind::RepeatedToolCall)
+        );
     }
 }
 

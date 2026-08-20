@@ -802,6 +802,9 @@
             "plugins": {
               "type": "boolean"
             },
+            "preempt_on_user_input": {
+              "type": "boolean"
+            },
             "prevent_idle_sleep": {
               "type": "boolean"
             },
@@ -824,6 +827,9 @@
               "type": "boolean"
             },
             "remote_plugin": {
+              "type": "boolean"
+            },
+            "repeat_guard": {
               "type": "boolean"
             },
             "request_permissions": {
@@ -5779,6 +5785,9 @@
         "plugins": {
           "type": "boolean"
         },
+        "preempt_on_user_input": {
+          "type": "boolean"
+        },
         "prevent_idle_sleep": {
           "type": "boolean"
         },
@@ -5801,6 +5810,9 @@
           "type": "boolean"
         },
         "remote_plugin": {
+          "type": "boolean"
+        },
+        "repeat_guard": {
           "type": "boolean"
         },
         "request_permissions": {

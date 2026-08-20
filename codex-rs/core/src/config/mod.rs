@@ -1257,12 +1257,25 @@ impl Default for CurrentTimeReminderConfig {
 pub struct RepeatGuardConfig {
     /// Number of identical (command, result) observations before the next call is blocked.
     pub block_after_repeats: u32,
+    /// Maximum consecutive auto-nudge turns when the guard blocks and the
+    /// model's turn ends without a further tool call. 0 disables auto-nudging.
+    pub auto_nudge_max: u32,
+    /// Seconds of active generation with no completed item (no message, no
+    /// tool call, nothing) before the turn is cut and auto-nudged, same as a
+    /// repeat-guard block. 0 disables this check. Added after a confirmed
+    /// 22-minute stall on the local profile: the rollout log showed a single
+    /// generation that produced zero items the entire time (2026-08-18) --
+    /// the repeat guard cannot see this at all, since it only tracks repeated
+    /// *tool calls*, and a stall like this never reaches one.
+    pub no_progress_timeout_secs: u32,
 }
 
 impl Default for RepeatGuardConfig {
     fn default() -> Self {
         Self {
             block_after_repeats: 3,
+            auto_nudge_max: 2,
+            no_progress_timeout_secs: 0,
         }
     }
 }
@@ -2924,6 +2937,12 @@ fn resolve_repeat_guard_config(
         block_after_repeats: base
             .and_then(|config| config.block_after_repeats)
             .unwrap_or(default.block_after_repeats),
+        auto_nudge_max: base
+            .and_then(|config| config.auto_nudge_max)
+            .unwrap_or(default.auto_nudge_max),
+        no_progress_timeout_secs: base
+            .and_then(|config| config.no_progress_timeout_secs)
+            .unwrap_or(default.no_progress_timeout_secs),
     })
 }
 
