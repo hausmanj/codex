@@ -143,6 +143,20 @@ pub(super) async fn handle(
     mode: TurnInputMode,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    // A human is present and steering, so clear the unattended-continue idle
+    // streak: whatever the agent was spinning on before, the person has now
+    // redirected it, and they should not have to prod it repeatedly because an
+    // earlier streak was already spent. Safe to do here because the automatic
+    // continue/nudge turns call `start_task` directly and never reach this
+    // client-submission path -- if they did, the streak could never increment
+    // and the session would continue itself forever.
+    if matches!(
+        request.input,
+        SubmittedTurnInput::UserInput { .. }
+    ) {
+        session.services.plan_progress.lock().await.reset_streak();
+    }
+
     match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {

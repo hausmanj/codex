@@ -548,6 +548,64 @@ impl Session {
         })
     }
 
+    /// Continue a turn that ended normally while the agent's own plan still
+    /// has unfinished steps.
+    ///
+    /// Deliberately separate from `maybe_start_auto_nudge_turn`: that path is
+    /// for *stalls* (a blocked repeat, a no-progress timeout), and an ordinary
+    /// `task_complete` is not one by any of those definitions -- which is
+    /// exactly why a half-finished session could sit idle overnight. Runs only
+    /// when the plan says work is outstanding, and stops if continuing stops
+    /// producing completed steps.
+    pub(crate) fn maybe_start_plan_continue_turn(
+        self: &Arc<Self>,
+        max_idle: u32,
+    ) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            let remaining = {
+                let mut plan = session.services.plan_progress.lock().await;
+                if !plan.take_continue(max_idle) {
+                    return;
+                }
+                plan.remaining()
+            };
+
+            {
+                let mut active_turn = session.active_turn.lock().await;
+                if active_turn.is_some() {
+                    return;
+                }
+                *active_turn = Some(ActiveTurn::default());
+            }
+
+            tracing::info!(
+                remaining_steps = remaining,
+                "plan continue: turn ended with unfinished plan steps, continuing"
+            );
+            let turn_context = session
+                .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+                .await;
+            session
+                .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                .await;
+            session
+                .start_task(
+                    turn_context,
+                    vec![TurnInput::UserInput {
+                        content: vec![UserInput::Text {
+                            text: crate::tools::plan_progress::plan_continue_message(remaining),
+                            text_elements: Vec::new(),
+                        }],
+                        client_id: None,
+                    }],
+                    RegularTask::new(),
+                    MailboxParentProvenance::Ignore,
+                )
+                .await;
+        })
+    }
+
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
@@ -925,6 +983,19 @@ impl Session {
                 .flatten();
             if let Some(auto_nudge_max) = auto_nudge_max {
                 self.maybe_start_auto_nudge_turn(auto_nudge_max).await;
+            }
+
+            // Only after the stall path has declined to nudge. A stall already
+            // gets its own (better-targeted) message, and starting two turns
+            // would race on active_turn.
+            if matches!(idle_cause, ThreadIdleCause::Completed)
+                && let Some(max_idle) = turn_context
+                    .config
+                    .repeat_guard
+                    .as_ref()
+                    .map(|c| c.plan_continue_max_idle)
+            {
+                self.maybe_start_plan_continue_turn(max_idle).await;
             }
         }
     }
