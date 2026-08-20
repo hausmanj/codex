@@ -31,10 +31,12 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_target_windows;
+use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
+use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::fs;
@@ -99,6 +101,91 @@ fn assert_no_matched_rules_invariant(output_item: &Value) {
         !output.contains("invariant failed: matched_rules must be non-empty"),
         "unexpected invariant panic surfaced in output: {output}"
     );
+}
+
+#[tokio::test]
+async fn git_status_requires_approval_under_unless_trusted() -> Result<()> {
+    skip_if_wine_exec!(Ok(()), "command approval requires host-native paths");
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_model("gpt-5.2").with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::UnlessTrusted);
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::workspace_write())
+            .expect("set workspace-write permissions");
+        config.approvals_reviewer = ApprovalsReviewer::User;
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+    let call_id = "git-status-approval";
+    let args = json!({"cmd": "git status", "yield_time_ms": 1_000});
+    let initial_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-git-status-1"),
+            ev_function_call(call_id, "exec_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-git-status-1"),
+        ]),
+    )
+    .await;
+    let results_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-git-status-1", "done"),
+            ev_completed("resp-git-status-2"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "check git status".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let event = wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::ExecApprovalRequest(_) | EventMsg::TurnComplete(_)
+        )
+    })
+    .await;
+    let EventMsg::ExecApprovalRequest(approval) = event else {
+        let output = results_mock.function_call_output_text(call_id);
+        panic!(
+            "expected git status to request approval before turn completion; output: {output:?}"
+        );
+    };
+    assert_eq!(approval.call_id, call_id);
+    test.codex
+        .submit(Op::ExecApproval {
+            id: approval.effective_approval_id(),
+            turn_id: None,
+            decision: ReviewDecision::denied("git status was not approved"),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert!(
+        initial_mock
+            .single_request()
+            .message_input_texts("user")
+            .iter()
+            .any(|text| text == "check git status")
+    );
+    let output = results_mock
+        .single_request()
+        .function_call_output_text(call_id)
+        .expect("shell command output");
+    assert!(output.contains("git status was not approved"), "{output}");
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -286,6 +373,68 @@ async fn granular_complex_forced_rm_requests_approval_when_allowed() -> Result<(
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn deeply_nested_forced_rm_is_rejected_before_execution_when_approvals_are_disabled()
+-> Result<()> {
+    skip_if_target_windows!(Ok(()), "uses a POSIX shell command fixture");
+
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let test = builder.build_with_auto_env(&server).await?;
+    let sentinel = test.config.cwd.join("forced-rm-sentinel");
+    fs::write(&sentinel, "must not be deleted")?;
+    let call_id = "deeply-nested-forced-rm";
+    let args = json!({
+        "command": "env env env env env env env env env rm -rf forced-rm-sentinel",
+        "timeout_ms": 1_000,
+    });
+
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-deeply-nested-forced-rm-1"),
+            ev_function_call(call_id, "shell_command", &serde_json::to_string(&args)?),
+            ev_completed("resp-deeply-nested-forced-rm-1"),
+        ]),
+    )
+    .await;
+    let results_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-deeply-nested-forced-rm", "done"),
+            ev_completed("resp-deeply-nested-forced-rm-2"),
+        ]),
+    )
+    .await;
+
+    submit_user_turn(
+        &test,
+        "run the deeply nested forced rm",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+        /*collaboration_mode*/ None,
+    )
+    .await?;
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let output_item = results_mock.single_request().function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("function call output should include a string output payload");
+    assert!(
+        output.contains("rejected: blocked by policy"),
+        "unexpected output: {output}"
+    );
+    assert!(sentinel.exists(), "the rejected command must not execute");
 
     Ok(())
 }
@@ -573,6 +722,7 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
                 exec_policy: Some(RequirementsExecPolicy::new(invalid_policy)),
+                mcp_policy: None,
                 network_policy: None,
                 selected_capability_roots: Vec::new(),
             },
@@ -595,6 +745,7 @@ async fn environment_command_restrictions_override_saved_prefix_approvals() -> R
                 permission_profile: PermissionProfileSnapshot::legacy(PermissionProfile::Disabled),
                 shell_environment_policy: Default::default(),
                 exec_policy: Some(RequirementsExecPolicy::new(environment_policy)),
+                mcp_policy: None,
                 network_policy: None,
                 selected_capability_roots: Vec::new(),
             },
@@ -698,6 +849,7 @@ async fn environment_command_policy_changes_invalidate_session_approvals() -> Re
                         ),
                         shell_environment_policy: Default::default(),
                         exec_policy: Some(RequirementsExecPolicy::new(policy)),
+                        mcp_policy: None,
                         network_policy: None,
                         selected_capability_roots: Vec::new(),
                     },

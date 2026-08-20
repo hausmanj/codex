@@ -6,10 +6,12 @@ use self::activation::installed_marketplace_metadata_matches;
 use self::activation::write_installed_marketplace_metadata;
 use self::git::clone_git_source;
 use self::git::git_remote_revision;
+use crate::PluginGitMode;
 use crate::installed_marketplaces::marketplace_install_root;
 use crate::marketplace::validate_marketplace_root;
 use crate::marketplace_add::MarketplaceSource;
 use crate::marketplace_policy::MarketplacePolicy;
+use crate::marketplace_policy::validate_marketplace_name_for_add;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerStack;
 use codex_config::MarketplaceConfigUpdate;
@@ -72,6 +74,21 @@ pub fn upgrade_configured_git_marketplaces(
     config_layer_stack: &ConfigLayerStack,
     marketplace_name: Option<&str>,
 ) -> ConfiguredMarketplaceUpgradeOutcome {
+    upgrade_configured_git_marketplaces_with_mode(
+        codex_home,
+        config_layer_stack,
+        marketplace_name,
+        PluginGitMode::Manual,
+    )
+}
+
+/// Applies the initiating operation's Git trust policy to every selected marketplace.
+pub(crate) fn upgrade_configured_git_marketplaces_with_mode(
+    codex_home: &Path,
+    config_layer_stack: &ConfigLayerStack,
+    marketplace_name: Option<&str>,
+    mode: PluginGitMode,
+) -> ConfiguredMarketplaceUpgradeOutcome {
     let loaded = load_configured_git_marketplaces(config_layer_stack);
     let marketplaces = loaded
         .marketplaces
@@ -99,7 +116,10 @@ pub fn upgrade_configured_git_marketplaces(
     let policy = MarketplacePolicy::from_requirements(config_layer_stack.requirements());
     for marketplace in marketplaces {
         let normalized_source =
-            match policy.validate_git_source(&marketplace.source, marketplace.ref_name.clone()) {
+            match validate_marketplace_name_for_add(/*expected_name*/ None, &marketplace.name)
+                .and_then(|()| {
+                    policy.validate_git_source(&marketplace.source, marketplace.ref_name.clone())
+                }) {
                 Ok(normalized_source) => normalized_source,
                 Err(message) => {
                     errors.push(ConfiguredMarketplaceUpgradeError {
@@ -114,6 +134,7 @@ pub fn upgrade_configured_git_marketplaces(
             &install_root,
             &marketplace,
             normalized_source.as_ref(),
+            mode,
         ) {
             Ok(Some(upgraded_root)) => upgraded_roots.push(upgraded_root),
             Ok(None) => {}
@@ -204,6 +225,7 @@ fn upgrade_configured_git_marketplace(
     install_root: &Path,
     marketplace: &ConfiguredGitMarketplace,
     normalized_source: Option<&MarketplaceSource>,
+    mode: PluginGitMode,
 ) -> Result<Option<AbsolutePathBuf>, String> {
     validate_plugin_segment(&marketplace.name, "marketplace name")?;
     let (source, ref_name) = match normalized_source {
@@ -213,7 +235,13 @@ fn upgrade_configured_git_marketplace(
         }
         None => (marketplace.source.as_str(), marketplace.ref_name.as_deref()),
     };
-    let remote_revision = git_remote_revision(source, ref_name, MARKETPLACE_UPGRADE_GIT_TIMEOUT)?;
+    let remote_revision = git_remote_revision(
+        codex_home,
+        source,
+        ref_name,
+        MARKETPLACE_UPGRADE_GIT_TIMEOUT,
+        mode,
+    )?;
     let destination = install_root.join(&marketplace.name);
     if validate_marketplace_root(&destination)
         .is_ok_and(|marketplace_name| marketplace_name == marketplace.name)
@@ -241,11 +269,13 @@ fn upgrade_configured_git_marketplace(
         })?;
 
     let activated_revision = clone_git_source(
+        codex_home,
         source,
         ref_name,
         &marketplace.sparse_paths,
         staged_dir.path(),
         MARKETPLACE_UPGRADE_GIT_TIMEOUT,
+        mode,
     )?;
     let marketplace_name = validate_marketplace_root(staged_dir.path())
         .map_err(|err| format!("failed to validate upgraded marketplace root: {err}"))?;

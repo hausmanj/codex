@@ -352,6 +352,35 @@
       },
       "type": "object"
     },
+    "AwsAuthRefreshConfig": {
+      "additionalProperties": false,
+      "description": "Command used to refresh AWS credentials for a model provider.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Arguments passed to the refresh command.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "Executable to invoke directly, without a shell.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 300000,
+          "description": "Maximum time to wait for the refresh command to complete.",
+          "format": "uint64",
+          "minimum": 1.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
     "BundledSkillsConfig": {
       "additionalProperties": false,
       "properties": {
@@ -727,6 +756,9 @@
               "type": "boolean"
             },
             "secret_auth_storage": {
+              "type": "boolean"
+            },
+            "send_async_message": {
               "type": "boolean"
             },
             "shell_snapshot": {
@@ -1881,6 +1913,14 @@
       "additionalProperties": false,
       "description": "AWS SigV4 auth configuration for a model provider.",
       "properties": {
+        "auth_refresh": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AwsAuthRefreshConfig"
+            }
+          ],
+          "description": "Optional command used to reauthenticate after a refreshable AWS auth failure."
+        },
         "profile": {
           "description": "AWS profile name to use. When unset, the AWS SDK default chain decides.",
           "type": "string"
@@ -3482,6 +3522,13 @@
             }
           ],
           "default": {
+            "agents": {
+              "new_task": null,
+              "rename": null,
+              "search": null,
+              "stop": null,
+              "toggle_grouping": null
+            },
             "approval": {
               "approve": null,
               "approve_for_prefix": null,
@@ -3527,6 +3574,7 @@
             "global": {
               "clear_terminal": null,
               "copy": null,
+              "open_agents": null,
               "open_external_editor": null,
               "open_transcript": null,
               "queue": null,
@@ -3733,6 +3781,53 @@
           "default": false,
           "description": "Start the composer in Vim mode (`Normal`) by default. Defaults to `false`.",
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "TuiAgentsKeymap": {
+      "additionalProperties": false,
+      "description": "Shortcuts specific to the shared agents overview.",
+      "properties": {
+        "new_task": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Start composing a new agent task."
+        },
+        "rename": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Rename the selected task."
+        },
+        "search": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Search the available agent tasks."
+        },
+        "stop": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Stop the selected running task."
+        },
+        "toggle_grouping": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Toggle grouping tasks by status or project."
         }
       },
       "type": "object"
@@ -4057,6 +4152,14 @@
           ],
           "description": "Copy the last agent response to the clipboard."
         },
+        "open_agents": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/KeybindingsSpec"
+            }
+          ],
+          "description": "Open the shared agent-session overview."
+        },
         "open_external_editor": {
           "allOf": [
             {
@@ -4136,6 +4239,20 @@
       "additionalProperties": false,
       "description": "Raw keymap configuration from `[tui.keymap]`.\n\nEach context contains action-level overrides. Missing actions inherit from built-in defaults, and selected chat/composer actions can fall back through `global` during runtime resolution.\n\nThis type is intentionally a persistence shape, not the structure used by input handlers. Runtime consumers should resolve it into `RuntimeKeymap` first so precedence, empty-list unbinding, and duplicate-key validation are applied consistently.",
       "properties": {
+        "agents": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TuiAgentsKeymap"
+            }
+          ],
+          "default": {
+            "new_task": null,
+            "rename": null,
+            "search": null,
+            "stop": null,
+            "toggle_grouping": null
+          }
+        },
         "approval": {
           "allOf": [
             {
@@ -4215,6 +4332,7 @@
           "default": {
             "clear_terminal": null,
             "copy": null,
+            "open_agents": null,
             "open_external_editor": null,
             "open_transcript": null,
             "queue": null,
@@ -5521,6 +5639,9 @@
           "type": "boolean"
         },
         "secret_auth_storage": {
+          "type": "boolean"
+        },
+        "send_async_message": {
           "type": "boolean"
         },
         "shell_snapshot": {

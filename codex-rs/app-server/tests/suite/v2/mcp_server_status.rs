@@ -28,6 +28,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_core::config::set_project_trust_level;
+use codex_http_client::HttpClientBuilder;
 use codex_protocol::config_types::TrustLevel;
 use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
@@ -48,11 +49,13 @@ use rmcp::transport::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use serde_json::json;
 use tempfile::TempDir;
+use test_case::test_case;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use url::Url;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
@@ -118,16 +121,15 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
         .await?;
     let response: McpServerOauthLoginResponse =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(request_id)).await??;
-    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let authorization_url = Url::parse(&response.authorization_url)?;
     let query: BTreeMap<_, _> = authorization_url.query_pairs().into_owned().collect();
-    let mut callback_url = reqwest::Url::parse(&query["redirect_uri"])?;
+    let mut callback_url = Url::parse(&query["redirect_uri"])?;
     callback_url
         .query_pairs_mut()
         .append_pair("code", "test-code")
         .append_pair("state", &query["state"]);
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()?
+    HttpClientBuilder::new()
+        .build_direct()?
         .get(callback_url)
         .send()
         .await?
@@ -150,16 +152,22 @@ async fn oauth_login_uses_http_headers_helper() -> Result<()> {
     Ok(())
 }
 
+#[test_case(false; "plain HTTP")]
+#[test_case(true; "HTTP headers helper")]
 #[tokio::test]
-async fn oauth_login_does_not_run_helper_disabled_by_managed_requirements() -> Result<()> {
+async fn oauth_login_rejects_servers_disabled_by_managed_requirements(
+    with_headers_helper: bool,
+) -> Result<()> {
     let codex_home = TempDir::new()?;
     let marker = codex_home.path().join("helper-ran");
-    let helper = toml::Value::String(format!("echo invoked > \"{}\"", marker.display()));
+    let helper = with_headers_helper
+        .then(|| toml::Value::String(format!("echo invoked > \"{}\"", marker.display())))
+        .map_or_else(String::new, |command| {
+            format!("http_headers_helper = {command}\n")
+        });
     std::fs::write(
         codex_home.path().join("config.toml"),
-        format!(
-            "[mcp_servers.blocked]\nurl = \"https://example.com/mcp\"\nhttp_headers_helper = {helper}\n"
-        ),
+        format!("[mcp_servers.blocked]\nurl = \"https://example.com/mcp\"\n{helper}"),
     )?;
     std::fs::write(
         codex_home.path().join("requirements.toml"),
@@ -348,13 +356,13 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         .await?;
     let response: McpServerOauthLoginResponse =
         timeout(DEFAULT_READ_TIMEOUT, app_server.read_response(request_id)).await??;
-    let authorization_url = reqwest::Url::parse(&response.authorization_url)?;
+    let authorization_url = Url::parse(&response.authorization_url)?;
     let parameters = authorization_url
         .query_pairs()
         .into_owned()
         .collect::<BTreeMap<String, String>>();
     let redirect_uri = parameters["redirect_uri"].clone();
-    let mut callback_url = reqwest::Url::parse(&redirect_uri)?;
+    let mut callback_url = Url::parse(&redirect_uri)?;
     let callback_id = callback_url
         .path()
         .strip_prefix("/callback/")
@@ -371,9 +379,8 @@ async fn oauth_login_automatically_selects_callback_specific_cimd_without_metada
         .query_pairs_mut()
         .append_pair("code", "cimd-authorization-code")
         .append_pair("state", &parameters["state"]);
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()?
+    HttpClientBuilder::new()
+        .build_direct()?
         .get(callback_url)
         .send()
         .await?

@@ -2637,6 +2637,92 @@ async fn list_all_tools_applies_legacy_mcp_prefix_by_default() {
 }
 
 #[tokio::test]
+async fn call_tool_requires_connection_without_waiting_for_startup() {
+    let client = create_test_managed_client(vec![create_test_tool("docs", "search")]).await;
+    let (client, startup_started, release_startup) = create_gated_async_managed_client(client);
+    let startup_client = client.clone();
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionSet::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.insert_test_client("docs", client);
+
+    let pending_call = tokio::time::timeout(
+        Duration::from_millis(50),
+        manager.call_tool(
+            "docs",
+            "search",
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(5)),
+            /*wait_for_server*/ false,
+        ),
+    )
+    .await
+    .expect("ready-only invocation must not wait for pending server startup")
+    .expect_err("pending server must not accept ready-only calls");
+    assert!(pending_call.to_string().contains("not connected"));
+
+    let startup = tokio::spawn(async move { startup_client.client().await });
+    startup_started.await.expect("server startup should begin");
+    release_startup.send(()).expect("release server startup");
+    startup
+        .await
+        .expect("startup task should finish")
+        .expect("server startup should succeed");
+
+    let ready_error = manager
+        .call_tool(
+            "docs",
+            "search",
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(5)),
+            /*wait_for_server*/ false,
+        )
+        .await
+        .expect_err("ready server should reach the uninitialized test transport");
+    assert!(format!("{ready_error:#}").contains("MCP client not initialized"));
+}
+
+#[tokio::test]
+async fn connected_call_respects_server_tool_filters() {
+    let client = create_ready_async_managed_client(vec![create_test_tool("docs", "search")]).await;
+    client.client().await.expect("server should be ready");
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionSet::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.insert_test_client("docs", client);
+    manager
+        .servers
+        .get_mut("docs")
+        .expect("test server should exist")
+        .tool_filter
+        .disabled
+        .insert("search".to_string());
+
+    let filtered_error = manager
+        .call_tool(
+            "docs",
+            "search",
+            /*arguments*/ None,
+            /*meta*/ None,
+            Some(Duration::from_secs(5)),
+            /*wait_for_server*/ false,
+        )
+        .await
+        .expect_err("disabled tools should not be callable");
+    assert!(filtered_error.to_string().contains("disabled"));
+}
+
+#[tokio::test]
 async fn list_all_tools_resolves_server_catalogs_concurrently() {
     let first_client = create_test_managed_client(vec![create_test_tool("first", "search")]).await;
     let second_client =
