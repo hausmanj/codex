@@ -330,6 +330,7 @@ pub struct RepeatGuardConfigToml {
     /// converges produces nothing for the guard to see repeat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_progress_timeout_secs: Option<u32>,
+    pub plan_continue_max_idle: Option<u32>,
 }
 
 impl FeatureConfig for RepeatGuardConfigToml {

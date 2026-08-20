@@ -1229,6 +1229,16 @@ pub struct RepeatGuardConfig {
     /// the repeat guard cannot see this at all, since it only tracks repeated
     /// *tool calls*, and a stall like this never reaches one.
     pub no_progress_timeout_secs: u32,
+    /// Consecutive auto-continues allowed when a turn ends with the agent's own
+    /// `update_plan` steps still unfinished. 0 disables it.
+    ///
+    /// This is NOT a cap on how long a session may run. Completing a plan step
+    /// resets the streak, so an agent that is genuinely working continues
+    /// indefinitely; the cap only stops one that ends turn after turn without
+    /// finishing anything. Added after a session announced its next step and
+    /// then idled for eleven hours because an ordinary `task_complete` is not a
+    /// stall and therefore never reached the auto-nudge path.
+    pub plan_continue_max_idle: u32,
 }
 
 impl Default for RepeatGuardConfig {
@@ -1237,6 +1247,7 @@ impl Default for RepeatGuardConfig {
             block_after_repeats: 3,
             auto_nudge_max: 2,
             no_progress_timeout_secs: 0,
+            plan_continue_max_idle: 0,
         }
     }
 }
@@ -2900,6 +2911,9 @@ fn resolve_repeat_guard_config(
         no_progress_timeout_secs: base
             .and_then(|config| config.no_progress_timeout_secs)
             .unwrap_or(default.no_progress_timeout_secs),
+        plan_continue_max_idle: base
+            .and_then(|config| config.plan_continue_max_idle)
+            .unwrap_or(default.plan_continue_max_idle),
     })
 }
 

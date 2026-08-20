@@ -1301,6 +1301,7 @@ impl Session {
                 models_manager: Arc::clone(&models_manager),
                 tool_approvals: Mutex::new(ApprovalStore::default()),
                 guardian_rejection_circuit_breaker: Mutex::new(Default::default()),
+                plan_progress: tokio::sync::Mutex::new(Default::default()),
                 repeat_call_guard: tokio::sync::Mutex::new(
                     crate::tools::repeat_guard::RepeatCallGuard::new(
                         config

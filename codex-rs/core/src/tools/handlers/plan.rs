@@ -88,6 +88,10 @@ impl PlanHandler {
         }
 
         let args = parse_update_plan_arguments(&arguments)?;
+        // Record before the event is sent -- this is the only place the plan's
+        // real state is observable, and on_task_finished needs it to decide
+        // whether a turn that ended early still has work outstanding.
+        session.services.plan_progress.lock().await.record(&args);
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
             .await;
