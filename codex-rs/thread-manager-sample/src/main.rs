@@ -304,6 +304,10 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         token_budget: None,
         rollout_budget: None,
         current_time_reminder: None,
+        // Added on this fork (see Config::repeat_guard). None = not configured,
+        // which is the same state as any user who has not set it, so the
+        // sample keeps upstream's default behaviour.
+        repeat_guard: None,
         features: Default::default(),
         suppress_unstable_features_warning: false,
         active_project: ProjectConfig { trust_level: None },
