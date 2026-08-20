@@ -51,6 +51,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::user_input::UserInput;
 use codex_thread_store::PersistContext;
 
 use codex_features::Feature;
@@ -484,6 +485,69 @@ impl Session {
         .await;
     }
 
+    /// Starts a follow-up turn nudging the model to pivot when the
+    /// repeat-tool-call guard blocked a call and the just-finished turn ended
+    /// without trying anything else afterward, instead of leaving the session
+    /// idle waiting on the user. See `RepeatCallGuard::take_stall_for_auto_nudge`
+    /// for the exact stall/cap semantics. No-op when the guard is disabled,
+    /// `auto_nudge_max` is 0, the per-streak cap is already spent, or another
+    /// turn already started (e.g. from pending mailbox work).
+    ///
+    /// Boxed for the same reason as `maybe_start_turn_for_pending_work`: this
+    /// is called from `on_task_finished`, which is itself reached through
+    /// `start_task`'s spawned future, and this function ends by calling
+    /// `start_task` again. Left un-boxed, that cycle makes the compiler unable
+    /// to prove the outer `tokio::spawn`'d future is `Send` (its size would be
+    /// self-referential). `Box::pin` erases the type at this boundary and
+    /// breaks the cycle, matching the existing sibling function exactly.
+    pub(crate) fn maybe_start_auto_nudge_turn(
+        self: &Arc<Self>,
+        auto_nudge_max: u32,
+    ) -> BoxFuture<'static, ()> {
+        let session = Arc::clone(self);
+        Box::pin(async move {
+            let Some(stall_kind) = ({
+                let mut guard = session.services.repeat_call_guard.lock().await;
+                guard.take_stall_for_auto_nudge(auto_nudge_max)
+            }) else {
+                return;
+            };
+
+            {
+                let mut active_turn = session.active_turn.lock().await;
+                if active_turn.is_some() {
+                    return;
+                }
+                *active_turn = Some(ActiveTurn::default());
+            }
+
+            tracing::info!(
+                stall_kind = ?stall_kind,
+                "repeat guard: turn ended stalled, auto-nudging"
+            );
+            let turn_context = session
+                .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
+                .await;
+            session
+                .maybe_emit_model_warnings_for_turn(turn_context.as_ref())
+                .await;
+            session
+                .start_task(
+                    turn_context,
+                    vec![TurnInput::UserInput {
+                        content: vec![UserInput::Text {
+                            text: crate::tools::repeat_guard::auto_nudge_message(stall_kind),
+                            text_elements: Vec::new(),
+                        }],
+                        client_id: None,
+                    }],
+                    RegularTask::new(),
+                    MailboxParentProvenance::Ignore,
+                )
+                .await;
+        })
+    }
+
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
@@ -835,6 +899,33 @@ impl Session {
         }
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
+            // Only for a genuine natural completion: an interrupted turn means
+            // the user (or mid-stream preemption) already redirected it, and a
+            // failed turn is a different problem the guard had no part in.
+            //
+            // Exception: a no-progress-timeout stall routes through the same
+            // abort machinery a real user interrupt does (there is no turn
+            // left to "complete" -- the watchdog cut it), so idle_cause here
+            // is `Interrupted` or `Failed`, not `Completed`, even though the
+            // guard genuinely wants to nudge. The peek below is scoped to
+            // *only* that stall kind for exactly this reason: widening the
+            // Completed-only rule itself would also let an unrelated
+            // repeat-guard block ride along and auto-nudge right after a
+            // real user interrupt, which is the failure mode this rule
+            // exists to prevent.
+            let no_progress_stall_pending = self
+                .services
+                .repeat_call_guard
+                .lock()
+                .await
+                .has_no_progress_stall_pending();
+            let auto_nudge_max = (matches!(idle_cause, ThreadIdleCause::Completed)
+                || no_progress_stall_pending)
+                .then(|| turn_context.config.repeat_guard.as_ref().map(|c| c.auto_nudge_max))
+                .flatten();
+            if let Some(auto_nudge_max) = auto_nudge_max {
+                self.maybe_start_auto_nudge_turn(auto_nudge_max).await;
+            }
         }
     }
 
