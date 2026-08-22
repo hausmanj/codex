@@ -995,7 +995,18 @@ impl Session {
             // Only after the stall path has declined to nudge. A stall already
             // gets its own (better-targeted) message, and starting two turns
             // would race on active_turn.
-            if matches!(idle_cause, ThreadIdleCause::Completed)
+            //
+            // A model/runtime failure is also recoverable when the agent's own
+            // plan is unfinished. Previously this was Completed-only, so an
+            // empty/failed Responses turn left an unattended session idle even
+            // though the plan continuation machinery could have retried it.
+            // Explicit interruption remains excluded: that means the user (or
+            // an intentional preemption) took control and must not be followed
+            // by an unsolicited turn.
+            let should_continue_plan = matches!(idle_cause, ThreadIdleCause::Completed)
+                || (matches!(idle_cause, ThreadIdleCause::Failed)
+                    && !no_progress_stall_pending);
+            if should_continue_plan
                 && let Some(max_idle) = turn_context
                     .config
                     .repeat_guard
