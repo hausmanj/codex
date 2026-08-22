@@ -657,8 +657,6 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(debug_assertions)]
         let pre_loop_exit_reason: Option<ExitReason> = None;
 
-        let mut terminal_lifecycle_shutdown =
-            Box::pin(crate::terminal_lifecycle::wait_for_shutdown());
         let exit_reason_result = if let Some(exit_reason) = pre_loop_exit_reason {
             Ok(exit_reason)
         } else {
@@ -675,10 +673,6 @@ See the Codex keymap documentation for supported actions and examples."
                     || (!waiting_for_initial_session_configured
                         && app.has_queued_startup_protected_request());
                 let control = select! {
-                    _ = &mut terminal_lifecycle_shutdown => {
-                        tracing::warn!("terminal lifecycle ended; shutting down active thread");
-                        app.handle_exit_mode(&mut app_server, ExitMode::ShutdownFirst).await
-                    }
                     Some(event) = app_event_rx.recv() => {
                         let is_initial_session_header = matches!(
                             &event,
