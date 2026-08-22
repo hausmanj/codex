@@ -1419,6 +1419,10 @@ impl ChatWidget {
         self.bottom_pane.show_shutdown_in_progress();
     }
 
+    pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
+        self.bottom_pane.exit_link_contains(column, row)
+    }
+
     fn request_redraw(&mut self) {
         self.frame_requester.schedule_frame();
     }
