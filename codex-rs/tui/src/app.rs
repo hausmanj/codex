@@ -1304,21 +1304,9 @@ See the Codex keymap documentation for supported actions and examples."
         event: TuiEvent,
     ) -> Result<AppRunControl> {
         let screen_size = tui.screen_size_for_event(&event)?;
-        if !matches!(
-            &event,
-            TuiEvent::Key(_) | TuiEvent::Paste(_) | TuiEvent::MousePress { .. }
-        ) {
+        if !matches!(&event, TuiEvent::Key(_) | TuiEvent::Paste(_)) {
             self.expire_pending_key_chord();
             self.handle_draw_pre_render(tui, screen_size)?;
-        }
-
-        if let TuiEvent::MousePress { column, row } = event {
-            if self.chat_widget.exit_link_contains(column, row) {
-                return Ok(self
-                    .handle_exit_mode(app_server, ExitMode::ShutdownFirst)
-                    .await);
-            }
-            return Ok(AppRunControl::Continue);
         }
 
         let event = if let TuiEvent::Key(key_event) = event {
@@ -1347,7 +1335,6 @@ See the Codex keymap documentation for supported actions and examples."
                     let pasted = pasted.replace("\r", "\n");
                     self.chat_widget.handle_paste(pasted);
                 }
-                TuiEvent::MousePress { .. } => {}
                 TuiEvent::Draw | TuiEvent::Resume | TuiEvent::Resize(_) => {
                     if self.backtrack_render_pending {
                         self.rebuild_transcript_after_backtrack(tui, screen_size.into())?;

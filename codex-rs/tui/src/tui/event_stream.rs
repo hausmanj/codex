@@ -26,8 +26,6 @@ use std::task::Context;
 use std::task::Poll;
 
 use crossterm::event::Event;
-use crossterm::event::MouseButton;
-use crossterm::event::MouseEventKind;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -249,7 +247,7 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
         }
     }
 
-    /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use.
+    /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use (mouse events, etc.).
     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
         match event {
             Event::Key(key_event) => {
@@ -273,14 +271,6 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
                 Some(TuiEvent::Resize(ratatui::layout::Size { width, height }))
             }
             Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
-            Event::Mouse(mouse)
-                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) =>
-            {
-                Some(TuiEvent::MousePress {
-                    column: mouse.column,
-                    row: mouse.row,
-                })
-            }
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
                 // Keep the startup-cached palette: querying terminal colors here blocks the
@@ -333,9 +323,6 @@ mod tests {
     use crossterm::event::KeyCode;
     use crossterm::event::KeyEvent;
     use crossterm::event::KeyModifiers;
-    use crossterm::event::MouseButton;
-    use crossterm::event::MouseEvent;
-    use crossterm::event::MouseEventKind;
     use pretty_assertions::assert_eq;
     use std::task::Context;
     use std::task::Poll;
@@ -533,46 +520,6 @@ mod tests {
             Some(TuiEvent::Resize(ratatui::layout::Size {
                 width: 80,
                 height: 24
-            }))
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn left_mouse_press_maps_without_mapping_wheel_events() {
-        let (broker, handle, _draw_tx, draw_rx, terminal_focused) = setup();
-        let mut stream = make_stream(broker, draw_rx, terminal_focused);
-
-        handle.send(Ok(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 12,
-            row: 34,
-            modifiers: KeyModifiers::NONE,
-        })));
-
-        assert!(matches!(
-            stream.next().await,
-            Some(TuiEvent::MousePress {
-                column: 12,
-                row: 34
-            })
-        ));
-
-        handle.send(Ok(Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 12,
-            row: 34,
-            modifiers: KeyModifiers::NONE,
-        })));
-        handle.send(Ok(Event::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::NONE,
-        ))));
-
-        assert!(matches!(
-            stream.next().await,
-            Some(TuiEvent::Key(KeyEvent {
-                code: KeyCode::Char('a'),
-                ..
             }))
         ));
     }

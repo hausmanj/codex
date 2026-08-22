@@ -228,10 +228,6 @@ pub fn set_modes() -> Result<()> {
     ensure_virtual_terminal_processing()?;
 
     execute!(stdout(), EnableBracketedPaste)?;
-    // X10/DECSET 9 reports button presses only. Unlike global mouse capture, it does not
-    // request wheel-motion reporting, preserving the terminal's native scrollback behavior.
-    #[cfg(unix)]
-    execute!(stdout(), EnablePressOnlyMouse)?;
 
     enable_raw_mode()?;
     #[cfg(windows)]
@@ -249,28 +245,6 @@ pub fn set_modes() -> Result<()> {
     #[cfg(windows)]
     let _ = execute!(stdout(), DisableFocusChange);
     Ok(())
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnablePressOnlyMouse;
-
-#[cfg(unix)]
-impl Command for EnablePressOnlyMouse {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[?9h")
-    }
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisablePressOnlyMouse;
-
-#[cfg(unix)]
-impl Command for DisablePressOnlyMouse {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        write!(f, "\x1b[?9l")
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,10 +312,6 @@ fn restore_common(
         KeyboardRestore::ResetAfterExit => keyboard_modes::reset_keyboard_reporting_after_exit(),
     }
 
-    #[cfg(unix)]
-    if let Err(err) = execute!(stdout(), DisablePressOnlyMouse) {
-        first_error.get_or_insert(err);
-    }
     if let Err(err) = execute!(stdout(), DisableBracketedPaste) {
         first_error.get_or_insert(err);
     }
@@ -592,8 +562,6 @@ pub enum TuiEvent {
     Key(KeyEvent),
     /// A bracketed paste payload normalized by the app layer before it reaches the composer.
     Paste(String),
-    /// A left-button press reported by X10 mouse mode. Wheel motion is intentionally never mapped.
-    MousePress { column: u16, row: u16 },
     /// A terminal size notification and its reported dimensions.
     ///
     /// Resize is separate from `Draw` so the app can run feature-gated pre-render logic without
