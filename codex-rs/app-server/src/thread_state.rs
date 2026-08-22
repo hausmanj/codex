@@ -96,6 +96,10 @@ pub(crate) struct ThreadState {
     pub(crate) pending_rollbacks: Option<ConnectionRequestId>,
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
+    /// Turn ID whose live events are currently accepted by this listener.
+    /// Late events from an older provider request must not be projected into
+    /// a newer turn on the same thread.
+    active_event_turn_id: Option<String>,
     /// Lets an internal runtime replacement wait until the old listener has processed Core's
     /// `ShutdownComplete` event before that listener is superseded.
     shutdown_drain_waiter: Option<oneshot::Sender<()>>,
@@ -143,6 +147,7 @@ impl ThreadState {
         self.shutdown_drain_waiter = None;
         self.listener_command_tx = None;
         self.current_turn_history.reset();
+        self.active_event_turn_id = None;
         self.listener_thread = None;
         self.watch_registration = WatchRegistration::default();
     }
@@ -171,7 +176,23 @@ impl ThreadState {
         self.shutdown_drain_waiter.take()
     }
 
-    pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
+    pub(crate) fn track_current_turn_event(
+        &mut self,
+        event_turn_id: &str,
+        event: &EventMsg,
+    ) -> bool {
+        if matches!(event, EventMsg::TurnStarted(_)) {
+            self.active_event_turn_id = Some(event_turn_id.to_string());
+        } else if Self::is_turn_scoped_event(event)
+            && self.active_event_turn_id.as_deref() != Some(event_turn_id)
+        {
+            tracing::warn!(
+                active_turn = ?self.active_event_turn_id,
+                event_turn = event_turn_id,
+                "dropping stale turn event"
+            );
+            return false;
+        }
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
         }
@@ -188,10 +209,30 @@ impl ThreadState {
         self.current_turn_history.handle_event(event);
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)) {
             self.last_terminal_turn_id = Some(event_turn_id.to_string());
+            self.active_event_turn_id = None;
             if !self.current_turn_history.has_active_turn() {
                 self.current_turn_history.reset();
             }
         }
+        true
+    }
+
+    fn is_turn_scoped_event(event: &EventMsg) -> bool {
+        !matches!(
+            event,
+            EventMsg::RealtimeConversationStarted(_)
+                | EventMsg::RealtimeConversationRealtime(_)
+                | EventMsg::RealtimeConversationClosed(_)
+                | EventMsg::RealtimeConversationSdp(_)
+                | EventMsg::SessionConfigured(_)
+                | EventMsg::EnvironmentConnected(_)
+                | EventMsg::EnvironmentDisconnected(_)
+                | EventMsg::ThreadQueueChanged(_)
+                | EventMsg::McpStartupUpdate(_)
+                | EventMsg::McpStartupComplete(_)
+                | EventMsg::DeprecationNotice(_)
+                | EventMsg::ShutdownComplete
+        )
     }
 
     pub(crate) fn note_thread_settings(&mut self, thread_settings: ThreadSettings) -> bool {
@@ -242,8 +283,51 @@ mod tests {
     use codex_protocol::config_types::CollaborationMode;
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
+    use codex_protocol::protocol::AgentMessageEvent;
+    use codex_protocol::protocol::TurnStartedEvent;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+
+    fn turn_started(turn_id: &str) -> EventMsg {
+        EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: turn_id.to_string(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        })
+    }
+
+    #[test]
+    fn stale_turn_events_are_rejected_after_a_new_turn_starts() {
+        let mut state = ThreadState::default();
+        assert!(state.track_current_turn_event("turn-1", &turn_started("turn-1")));
+
+        let stale = EventMsg::AgentMessage(AgentMessageEvent {
+            message: "old response".to_string(),
+            phase: None,
+            memory_citation: None,
+            delivery: None,
+        });
+        assert!(!state.track_current_turn_event("turn-0", &stale));
+        assert!(state.track_current_turn_event("turn-1", &stale));
+    }
+
+    #[test]
+    fn a_new_turn_replaces_the_previous_event_fence() {
+        let mut state = ThreadState::default();
+        assert!(state.track_current_turn_event("turn-1", &turn_started("turn-1")));
+        assert!(state.track_current_turn_event("turn-2", &turn_started("turn-2")));
+
+        let stale = EventMsg::AgentMessage(AgentMessageEvent {
+            message: "old response".to_string(),
+            phase: None,
+            memory_citation: None,
+            delivery: None,
+        });
+        assert!(!state.track_current_turn_event("turn-1", &stale));
+        assert!(state.track_current_turn_event("turn-2", &stale));
+    }
 
     #[test]
     fn note_thread_settings_reports_only_effective_changes() {

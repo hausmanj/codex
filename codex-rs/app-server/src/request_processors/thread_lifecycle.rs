@@ -327,7 +327,9 @@ pub(super) async fn ensure_listener_task_running(
                     // synchronized with the conversation.
                     let raw_events_enabled = {
                         let mut thread_state = thread_state.lock().await;
-                        thread_state.track_current_turn_event(&event.id, &event.msg);
+                        if !thread_state.track_current_turn_event(&event.id, &event.msg) {
+                            continue;
+                        }
                         thread_state.experimental_raw_events
                     };
                     if matches!(
