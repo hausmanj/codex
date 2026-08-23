@@ -756,9 +756,11 @@ impl ModelProvider for TestRecoveryProvider {
     fn models_manager(
         &self,
         codex_home: PathBuf,
+        provider_id: String,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
-        self.inner.models_manager(codex_home, config_model_catalog)
+        self.inner
+            .models_manager(codex_home, provider_id, config_model_catalog)
     }
 }
 

@@ -365,6 +365,7 @@ pub fn build_models_manager(
     let provider = create_model_provider(config.model_provider.clone(), Some(auth_manager));
     provider.models_manager(
         config.codex_home.to_path_buf(),
+        config.model_provider_id.clone(),
         config.model_catalog.clone(),
     )
 }
@@ -612,7 +613,11 @@ impl ThreadManager {
                 thread_created_tx,
                 thread_id_generator: default_thread_id_generator(),
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
-                    .models_manager(codex_home, /*config_model_catalog*/ None),
+                    .models_manager(
+                        codex_home,
+                        OPENAI_PROVIDER_ID.to_string(),
+                        /*config_model_catalog*/ None,
+                    ),
                 environment_manager,
                 starting_mcp_runtimes: std::sync::Mutex::new(Vec::new()),
                 skills_service,

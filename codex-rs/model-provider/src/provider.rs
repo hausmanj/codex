@@ -258,6 +258,7 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     fn models_manager(
         &self,
         codex_home: PathBuf,
+        provider_id: String,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager;
 
@@ -283,10 +284,12 @@ pub trait ModelProvider: fmt::Debug + Send + Sync {
     /// `config_model_catalog` supplies an authoritative static catalog.
     fn models_manager_with_cache(
         &self,
+        provider_id: String,
         config_model_catalog: Option<ModelsResponse>,
         cache: Arc<dyn ModelsCache>,
     ) -> SharedModelsManager {
         drop(cache);
+        drop(provider_id);
         self.models_manager_without_cache(config_model_catalog)
     }
 }
@@ -432,6 +435,7 @@ impl ModelProvider for ConfiguredModelProvider {
     fn models_manager(
         &self,
         codex_home: PathBuf,
+        provider_id: String,
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
         match config_model_catalog {
@@ -444,11 +448,20 @@ impl ModelProvider for ConfiguredModelProvider {
                     self.info.clone(),
                     self.auth_manager.clone(),
                 ));
-                Arc::new(OpenAiModelsManager::new(
-                    codex_home,
-                    endpoint,
-                    self.auth_manager.clone(),
-                ))
+                if self.info.skip_models_cache {
+                    Arc::new(OpenAiModelsManager::new_without_cache(
+                        provider_id,
+                        endpoint,
+                        self.auth_manager.clone(),
+                    ))
+                } else {
+                    Arc::new(OpenAiModelsManager::new(
+                        codex_home,
+                        provider_id,
+                        endpoint,
+                        self.auth_manager.clone(),
+                    ))
+                }
             }
         }
     }
@@ -468,6 +481,7 @@ impl ModelProvider for ConfiguredModelProvider {
                     self.auth_manager.clone(),
                 ));
                 Arc::new(OpenAiModelsManager::new_without_cache(
+                    self.info.name.clone(),
                     endpoint,
                     self.auth_manager.clone(),
                 ))
@@ -477,6 +491,7 @@ impl ModelProvider for ConfiguredModelProvider {
 
     fn models_manager_with_cache(
         &self,
+        provider_id: String,
         config_model_catalog: Option<ModelsResponse>,
         cache: Arc<dyn ModelsCache>,
     ) -> SharedModelsManager {
@@ -492,6 +507,7 @@ impl ModelProvider for ConfiguredModelProvider {
                 ));
                 Arc::new(OpenAiModelsManager::new_with_cache(
                     cache,
+                    provider_id,
                     endpoint,
                     self.auth_manager.clone(),
                 ))
@@ -574,6 +590,7 @@ mod tests {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            skip_models_cache: false,
         }
     }
 
@@ -1033,8 +1050,11 @@ mod tests {
             ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None),
             /*auth_manager*/ None,
         );
-        let manager =
-            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let manager = provider.models_manager(
+            test_codex_home(),
+            "amazon-bedrock".to_string(),
+            /*config_model_catalog*/ None,
+        );
         let uncached_manager =
             provider.models_manager_without_cache(/*config_model_catalog*/ None);
 
@@ -1128,6 +1148,7 @@ mod tests {
         );
         let manager = provider.models_manager(
             test_codex_home(),
+            "amazon-bedrock".to_string(),
             Some(ModelsResponse {
                 models: vec![configured_model],
             }),
@@ -1178,8 +1199,11 @@ mod tests {
             )),
         );
 
-        let manager =
-            provider.models_manager(test_codex_home(), /*config_model_catalog*/ None);
+        let manager = provider.models_manager(
+            test_codex_home(),
+            "test-provider".to_string(),
+            /*config_model_catalog*/ None,
+        );
         let catalog = manager
             .raw_model_catalog(
                 RefreshStrategy::Online,

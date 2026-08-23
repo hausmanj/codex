@@ -1,5 +1,6 @@
 use chrono::DateTime;
 use chrono::Utc;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::openai_models::ModelInfo;
 use serde::Deserialize;
 use serde::Serialize;
@@ -52,6 +53,7 @@ pub trait ModelsCache: fmt::Debug + Send + Sync {
     fn refresh_ttl<'a>(
         &'a self,
         client_version: &'a str,
+        cache_key: &'a ModelsCacheKey,
     ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>>;
 }
 
@@ -71,11 +73,27 @@ pub struct ModelsCacheEntry {
     /// The models manager rejects entries whose value is absent or differs from its current version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
+    /// Provider and account identity that produced this catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<ModelsCacheKey>,
     /// Models returned by the catalog endpoint.
     #[serde(
         deserialize_with = "codex_protocol::openai_models::deserialize_model_infos_with_legacy_base"
     )]
     pub models: Vec<ModelInfo>,
+}
+
+/// Identity used to prevent a catalog from one provider or account being reused by another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelsCacheKey {
+    /// Stable provider ID from the active Codex configuration.
+    pub provider_id: String,
+    /// Authentication mode, when the provider uses Codex-managed auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<AuthMode>,
+    /// Account ID for auth modes that expose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl ModelsCacheEntry {
@@ -152,12 +170,16 @@ impl ModelsCache for FileModelsCache {
     fn refresh_ttl<'a>(
         &'a self,
         _client_version: &'a str,
+        expected_cache_key: &'a ModelsCacheKey,
     ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
         Box::pin(async move {
             let mut entry = load_file(&self.cache_path)
                 .await
                 .map_err(cache_error)?
                 .ok_or_else(|| ModelsCacheError::new("cache not found"))?;
+            if entry.cache_key.as_ref() != Some(expected_cache_key) {
+                return Err(ModelsCacheError::new("models cache key mismatch"));
+            }
             if entry.is_fresh(self.cache_ttl / 2) {
                 return Ok(());
             }

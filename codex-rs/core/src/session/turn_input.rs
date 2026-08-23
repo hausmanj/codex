@@ -150,10 +150,7 @@ pub(super) async fn handle(
     // continue/nudge turns call `start_task` directly and never reach this
     // client-submission path -- if they did, the streak could never increment
     // and the session would continue itself forever.
-    if matches!(
-        request.input,
-        SubmittedTurnInput::UserInput { .. }
-    ) {
+    if matches!(request.input, SubmittedTurnInput::UserInput { .. }) {
         session.services.plan_progress.lock().await.reset_streak();
     }
 

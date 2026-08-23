@@ -979,7 +979,13 @@ impl Session {
                 .has_no_progress_stall_pending();
             let auto_nudge_max = (matches!(idle_cause, ThreadIdleCause::Completed)
                 || no_progress_stall_pending)
-                .then(|| turn_context.config.repeat_guard.as_ref().map(|c| c.auto_nudge_max))
+                .then(|| {
+                    turn_context
+                        .config
+                        .repeat_guard
+                        .as_ref()
+                        .map(|c| c.auto_nudge_max)
+                })
                 .flatten();
             if let Some(auto_nudge_max) = auto_nudge_max {
                 self.maybe_start_auto_nudge_turn(auto_nudge_max).await;
@@ -997,8 +1003,7 @@ impl Session {
             // an intentional preemption) took control and must not be followed
             // by an unsolicited turn.
             let should_continue_plan = matches!(idle_cause, ThreadIdleCause::Completed)
-                || (matches!(idle_cause, ThreadIdleCause::Failed)
-                    && !no_progress_stall_pending);
+                || (matches!(idle_cause, ThreadIdleCause::Failed) && !no_progress_stall_pending);
             if should_continue_plan
                 && let Some(max_idle) = turn_context
                     .config

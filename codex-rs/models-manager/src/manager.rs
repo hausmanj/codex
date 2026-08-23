@@ -1,6 +1,7 @@
 use super::cache::FileModelsCache;
 use crate::cache::ModelsCache;
 use crate::cache::ModelsCacheEntry;
+use crate::cache::ModelsCacheKey;
 use crate::collaboration_mode_presets::builtin_collaboration_mode_presets;
 use crate::config::ModelsManagerConfig;
 use crate::model_info;
@@ -216,6 +217,7 @@ pub type SharedModelsManager = Arc<dyn ModelsManager>;
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
+    cache_key: ModelsCacheKey,
     remote_models: RwLock<Vec<ModelInfo>>,
     etag: RwLock<Option<String>>,
     cache: Option<Arc<dyn ModelsCache>>,
@@ -234,6 +236,7 @@ impl OpenAiModelsManager {
     /// Construct an OpenAI-compatible remote model manager.
     pub fn new(
         codex_home: PathBuf,
+        provider_id: String,
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
@@ -243,6 +246,7 @@ impl OpenAiModelsManager {
                 cache_path,
                 DEFAULT_MODEL_CACHE_TTL,
             ))),
+            provider_id,
             endpoint_client,
             auth_manager,
         )
@@ -250,10 +254,16 @@ impl OpenAiModelsManager {
 
     /// Construct an OpenAI-compatible model manager with caching disabled.
     pub fn new_without_cache(
+        provider_id: String,
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
-        Self::new_with_optional_cache(/*cache*/ None, endpoint_client, auth_manager)
+        Self::new_with_optional_cache(
+            /*cache*/ None,
+            provider_id,
+            endpoint_client,
+            auth_manager,
+        )
     }
 
     /// Constructs an OpenAI-compatible model manager with a caller-provided cache.
@@ -262,19 +272,31 @@ impl OpenAiModelsManager {
     /// fall back to the models endpoint, and cache write failures do not fail model discovery.
     pub fn new_with_cache(
         cache: Arc<dyn ModelsCache>,
+        provider_id: String,
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
-        Self::new_with_optional_cache(Some(cache), endpoint_client, auth_manager)
+        Self::new_with_optional_cache(Some(cache), provider_id, endpoint_client, auth_manager)
     }
 
     fn new_with_optional_cache(
         cache: Option<Arc<dyn ModelsCache>>,
+        provider_id: String,
         endpoint_client: Arc<dyn ModelsEndpointClient>,
         auth_manager: Option<Arc<AuthManager>>,
     ) -> Self {
         let remote_models = load_remote_models_from_file().unwrap_or_default();
         Self {
+            cache_key: ModelsCacheKey {
+                provider_id,
+                auth_mode: auth_manager
+                    .as_ref()
+                    .and_then(|auth_manager| auth_manager.auth_mode()),
+                account_id: auth_manager
+                    .as_ref()
+                    .and_then(|auth_manager| auth_manager.auth_cached())
+                    .and_then(|auth| auth.get_account_id()),
+            },
             remote_models: RwLock::new(remote_models),
             etag: RwLock::new(None),
             cache,
@@ -357,7 +379,9 @@ impl OpenAiModelsManager {
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
             if let Some(cache) = self.cache.as_ref()
-                && let Err(err) = cache.refresh_ttl(&crate::client_version_to_whole()).await
+                && let Err(err) = cache
+                    .refresh_ttl(&crate::client_version_to_whole(), &self.cache_key)
+                    .await
             {
                 error!("failed to renew cache TTL: {err}");
             }
@@ -425,6 +449,7 @@ impl OpenAiModelsManager {
                 fetched_at: Utc::now(),
                 etag,
                 client_version: Some(client_version),
+                cache_key: Some(self.cache_key.clone()),
                 models,
             };
             if let Err(err) = cache.store(&entry).await {
@@ -474,7 +499,7 @@ impl OpenAiModelsManager {
         *self.remote_models.write().await = existing_models;
     }
 
-    /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
+    /// Attempt to satisfy the refresh from the cache when it matches the provider, account, and TTL.
     async fn try_load_cache(&self) -> bool {
         let Some(cache) = self.cache.as_ref() else {
             return false;
@@ -483,8 +508,6 @@ impl OpenAiModelsManager {
             codex_otel::start_global_timer("codex.remote_models.load_cache.duration_ms", &[]);
         let client_version = crate::client_version_to_whole();
         info!(client_version, "models cache: evaluating cache eligibility");
-        // TODO(celia-oai): Include provider identity in cache eligibility so switching
-        // providers does not reuse a fresh models_cache.json entry from another provider.
         let cache_entry = match cache.load(&client_version).await {
             Ok(Some(cache_entry)) => cache_entry,
             Ok(None) => {
@@ -501,6 +524,14 @@ impl OpenAiModelsManager {
                 expected_version = client_version,
                 cached_version = ?cache_entry.client_version,
                 "models cache: cache version mismatch"
+            );
+            return false;
+        }
+        if cache_entry.cache_key.as_ref() != Some(&self.cache_key) {
+            info!(
+                expected_provider = %self.cache_key.provider_id,
+                cached_key = ?cache_entry.cache_key,
+                "models cache: provider or account mismatch"
             );
             return false;
         }

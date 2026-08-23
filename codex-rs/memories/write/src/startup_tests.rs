@@ -885,10 +885,11 @@ impl ModelProvider for MockMemoryModelProvider {
     fn models_manager(
         &self,
         codex_home: PathBuf,
+        provider_id: String,
         config_model_catalog: Option<ModelsResponse>,
     ) -> codex_models_manager::manager::SharedModelsManager {
         self.delegate
-            .models_manager(codex_home, config_model_catalog)
+            .models_manager(codex_home, provider_id, config_model_catalog)
     }
 }
 

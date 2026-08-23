@@ -313,6 +313,7 @@ mod tests {
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
             supports_websockets: true,
+            skip_models_cache: false,
             supports_standalone_web_search: true,
         }
     }

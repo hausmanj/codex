@@ -5,6 +5,7 @@ use crate::cache::ModelsCache;
 use crate::cache::ModelsCacheEntry;
 use crate::cache::ModelsCacheError;
 use crate::cache::ModelsCacheFuture;
+use crate::cache::ModelsCacheKey;
 use chrono::Utc;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -164,6 +165,7 @@ impl ModelsCache for TestModelsCache {
     fn refresh_ttl<'a>(
         &'a self,
         _client_version: &'a str,
+        _cache_key: &'a ModelsCacheKey,
     ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
         Box::pin(async move {
             let refreshed = {
@@ -301,7 +303,20 @@ fn openai_manager_for_tests_with_auth(
     endpoint_client: Arc<dyn ModelsEndpointClient>,
     auth_manager: Option<Arc<AuthManager>>,
 ) -> OpenAiModelsManager {
-    OpenAiModelsManager::new(codex_home, endpoint_client, auth_manager)
+    OpenAiModelsManager::new(
+        codex_home,
+        "test-provider".to_string(),
+        endpoint_client,
+        auth_manager,
+    )
+}
+
+fn test_cache_key(provider_id: &str) -> ModelsCacheKey {
+    ModelsCacheKey {
+        provider_id: provider_id.to_string(),
+        auth_mode: Some(AuthMode::Chatgpt),
+        account_id: Some("account_id".to_string()),
+    }
 }
 
 async fn mutate_file_cache_for_test<F>(codex_home: &Path, f: F)
@@ -335,6 +350,7 @@ async fn file_cache_implements_models_cache_contract() {
         fetched_at: Utc::now(),
         etag: Some("file-etag".to_string()),
         client_version: Some(client_version.clone()),
+        cache_key: Some(test_cache_key("test-provider")),
         models: vec![remote_model(
             "file-cached",
             "File Cached",
@@ -366,6 +382,7 @@ async fn file_cache_refresh_ttl_renews_expired_entry_without_serving_it_stale() 
         fetched_at: expired_at,
         etag: Some("expired-etag".to_string()),
         client_version: Some(client_version.clone()),
+        cache_key: Some(test_cache_key("test-provider")),
         models: vec![remote_model(
             "expired-file-cache",
             "Expired File Cache",
@@ -384,7 +401,7 @@ async fn file_cache_refresh_ttl_renews_expired_entry_without_serving_it_stale() 
     );
 
     cache
-        .refresh_ttl(&client_version)
+        .refresh_ttl(&client_version, &test_cache_key("test-provider"))
         .await
         .expect("TTL refresh succeeds");
 
@@ -404,6 +421,7 @@ async fn manager_without_cache_fetches_on_every_refresh() {
     let remote_models = vec![remote_model("remote", "Remote", /*priority*/ 0)];
     let endpoint = TestModelsEndpoint::new(vec![remote_models.clone(), remote_models.clone()]);
     let manager = OpenAiModelsManager::new_without_cache(
+        "test-provider".to_string(),
         endpoint.clone(),
         Some(AuthManager::from_auth_for_testing(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -436,6 +454,7 @@ async fn injected_cache_hit_avoids_remote_fetch() {
         fetched_at: Utc::now(),
         etag: Some("cached-etag".to_string()),
         client_version: Some(crate::client_version_to_whole()),
+        cache_key: Some(test_cache_key("test-provider")),
         models: cached_models.clone(),
     });
     let endpoint = TestModelsEndpoint::new(vec![vec![remote_model(
@@ -443,6 +462,7 @@ async fn injected_cache_hit_avoids_remote_fetch() {
     )]]);
     let manager = OpenAiModelsManager::new_with_cache(
         cache,
+        "test-provider".to_string(),
         endpoint.clone(),
         Some(AuthManager::from_auth_for_testing(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -467,6 +487,7 @@ async fn injected_cache_read_error_falls_back_and_persists_remote_models() {
     let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
     let manager = OpenAiModelsManager::new_with_cache(
         cache.clone(),
+        "test-provider".to_string(),
         endpoint.clone(),
         Some(AuthManager::from_auth_for_testing(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -489,6 +510,7 @@ async fn injected_cache_read_error_falls_back_and_persists_remote_models() {
             fetched_at: stored_entries[0].fetched_at,
             etag: None,
             client_version: Some(crate::client_version_to_whole()),
+            cache_key: Some(test_cache_key("test-provider")),
             models: remote_models,
         }]
     );
@@ -501,6 +523,7 @@ async fn injected_cache_write_error_does_not_fail_remote_refresh() {
     let endpoint = TestModelsEndpoint::new(vec![remote_models.clone()]);
     let manager = OpenAiModelsManager::new_with_cache(
         cache,
+        "test-provider".to_string(),
         endpoint.clone(),
         Some(AuthManager::from_auth_for_testing(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -526,14 +549,16 @@ async fn injected_cache_ttl_refresh_preserves_cached_payload() {
         fetched_at: cached_at,
         etag: Some("cached-etag".to_string()),
         client_version: Some(crate::client_version_to_whole()),
+        cache_key: Some(test_cache_key("test-provider")),
         models: cached_models.clone(),
     });
     let manager = OpenAiModelsManager::new_with_cache(
         cache.clone(),
+        "test-provider".to_string(),
         TestModelsEndpoint::new(Vec::new()),
-        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
-            "test-api-key",
-        ))),
+        Some(AuthManager::from_auth_for_testing(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        )),
     );
 
     manager
@@ -1163,6 +1188,7 @@ async fn refresh_available_models_drops_removed_remote_models() {
             codex_home.path().join(MODEL_CACHE_FILE),
             Duration::ZERO,
         )),
+        "test-provider".to_string(),
         endpoint.clone(),
         Some(AuthManager::from_auth_for_testing(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),

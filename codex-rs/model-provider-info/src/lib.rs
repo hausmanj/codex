@@ -148,6 +148,9 @@ pub struct ModelProviderInfo {
     /// Whether this provider supports the standalone web-search endpoint.
     #[serde(default)]
     pub supports_standalone_web_search: bool,
+    /// Whether to skip the disk-backed model catalog cache for this provider.
+    #[serde(default)]
+    pub skip_models_cache: bool,
 }
 
 /// AWS SigV4 auth configuration for a model provider.
@@ -417,6 +420,7 @@ impl ModelProviderInfo {
             requires_openai_auth: true,
             supports_websockets: true,
             supports_standalone_web_search: true,
+            skip_models_cache: false,
         }
     }
 
@@ -452,6 +456,7 @@ impl ModelProviderInfo {
             requires_openai_auth: false,
             supports_websockets: false,
             supports_standalone_web_search: false,
+            skip_models_cache: false,
         }
     }
 
@@ -619,6 +624,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         requires_openai_auth: false,
         supports_websockets: false,
         supports_standalone_web_search: false,
+        skip_models_cache: false,
     }
 }
 

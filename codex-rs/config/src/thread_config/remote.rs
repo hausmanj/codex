@@ -192,6 +192,7 @@ fn model_provider_from_proto(
         requires_openai_auth: provider.requires_openai_auth,
         supports_websockets: provider.supports_websockets,
         supports_standalone_web_search: provider.supports_standalone_web_search,
+        skip_models_cache: false,
     };
     Ok((id, info))
 }
@@ -220,6 +221,7 @@ fn model_provider_to_proto(
         requires_openai_auth,
         supports_websockets,
         supports_standalone_web_search,
+        skip_models_cache: _,
     } = provider;
 
     proto::ModelProvider {

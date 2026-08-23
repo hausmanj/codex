@@ -13,6 +13,7 @@ use codex_models_manager::cache::ModelsCache;
 use codex_models_manager::cache::ModelsCacheEntry;
 use codex_models_manager::cache::ModelsCacheError;
 use codex_models_manager::cache::ModelsCacheFuture;
+use codex_models_manager::cache::ModelsCacheKey;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::OpenAiModelsManager;
@@ -73,6 +74,7 @@ impl ModelsCache for TestModelsCache {
     fn refresh_ttl<'a>(
         &'a self,
         _client_version: &'a str,
+        _cache_key: &'a ModelsCacheKey,
     ) -> ModelsCacheFuture<'a, Result<(), ModelsCacheError>> {
         Box::pin(async move {
             let mut entry = self
@@ -139,6 +141,7 @@ fn models_manager(
 ) -> SharedModelsManager {
     Arc::new(OpenAiModelsManager::new_with_cache(
         cache,
+        "test-provider".to_string(),
         endpoint,
         Some(AuthManager::from_auth_for_testing(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
@@ -213,6 +216,11 @@ async fn injected_cache_hit_drives_agent_model_selection() -> Result<()> {
             fetched_at: Utc::now(),
             etag: None,
             client_version: Some(codex_models_manager::client_version_to_whole()),
+            cache_key: Some(ModelsCacheKey {
+                provider_id: "test-provider".to_string(),
+                auth_mode: Some(codex_protocol::auth::AuthMode::Chatgpt),
+                account_id: Some("account_id".to_string()),
+            }),
             models: vec![remote_model(model_slug)],
         }),
         load_error: false,

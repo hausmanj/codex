@@ -113,7 +113,10 @@ mod tests {
     fn no_plan_recorded_means_no_continuation() {
         let mut p = PlanProgress::default();
         assert!(!p.has_unfinished_work());
-        assert!(!p.take_continue(3), "a session that never planned must not be continued");
+        assert!(
+            !p.take_continue(3),
+            "a session that never planned must not be continued"
+        );
     }
 
     #[test]
@@ -130,17 +133,28 @@ mod tests {
         p.record(&plan(&[StepStatus::Completed, StepStatus::Pending]));
         assert!(p.take_continue(2));
         assert!(p.take_continue(2));
-        assert!(!p.take_continue(2), "must stop once the idle streak hits the cap");
+        assert!(
+            !p.take_continue(2),
+            "must stop once the idle streak hits the cap"
+        );
     }
 
     #[test]
     fn real_progress_resets_the_streak_so_a_working_agent_runs_indefinitely() {
         let mut p = PlanProgress::default();
-        p.record(&plan(&[StepStatus::Pending, StepStatus::Pending, StepStatus::Pending]));
+        p.record(&plan(&[
+            StepStatus::Pending,
+            StepStatus::Pending,
+            StepStatus::Pending,
+        ]));
         assert!(p.take_continue(1));
         assert!(!p.take_continue(1), "streak exhausted");
         // The agent completes a step -- it is working, not spinning.
-        p.record(&plan(&[StepStatus::Completed, StepStatus::Pending, StepStatus::Pending]));
+        p.record(&plan(&[
+            StepStatus::Completed,
+            StepStatus::Pending,
+            StepStatus::Pending,
+        ]));
         assert!(p.take_continue(1), "progress must buy another continue");
     }
 
@@ -151,7 +165,10 @@ mod tests {
         assert!(p.take_continue(1));
         // Same completed count, different wording/status churn.
         p.record(&plan(&[StepStatus::InProgress, StepStatus::Pending]));
-        assert!(!p.take_continue(1), "status churn without completion must not reset the streak");
+        assert!(
+            !p.take_continue(1),
+            "status churn without completion must not reset the streak"
+        );
     }
 
     #[test]
@@ -175,13 +192,20 @@ mod tests {
         assert!(p.take_continue(1));
         assert!(!p.take_continue(1));
         p.reset_streak();
-        assert!(p.take_continue(1), "human steering must not leave the session stuck");
+        assert!(
+            p.take_continue(1),
+            "human steering must not leave the session stuck"
+        );
     }
 
     #[test]
     fn remaining_counts_unfinished_steps() {
         let mut p = PlanProgress::default();
-        p.record(&plan(&[StepStatus::Completed, StepStatus::Pending, StepStatus::InProgress]));
+        p.record(&plan(&[
+            StepStatus::Completed,
+            StepStatus::Pending,
+            StepStatus::InProgress,
+        ]));
         assert_eq!(p.remaining(), 2);
     }
 }
