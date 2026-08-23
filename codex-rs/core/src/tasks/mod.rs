@@ -900,6 +900,9 @@ impl Session {
         } else {
             ThreadIdleCause::Completed
         };
+        let implicit_transition = crate::tools::plan_progress::looks_like_implicit_transition(
+            last_agent_message.as_deref().unwrap_or_default(),
+        );
         let event = if let Some(reason) = abort_reason {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -1011,6 +1014,10 @@ impl Session {
                     .as_ref()
                     .map(|c| c.plan_continue_max_idle)
             {
+                if implicit_transition {
+                    let mut plan = self.services.plan_progress.lock().await;
+                    plan.record_implicit_transition();
+                }
                 self.maybe_start_plan_continue_turn(max_idle).await;
             }
         }
