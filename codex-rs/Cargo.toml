@@ -139,7 +139,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.149.0"
+# Fork version. Upstream stamps real versions only at release tags (main and
+# release branches both carry the 0.0.0 placeholder), so there is no upstream
+# version to copy. Our upstream base sits in the 0.150.0-alpha window: it is
+# past the point where release/0.149 was cut (#39666) and is an ancestor of
+# rust-v0.150.0-alpha.10, trailing that tag by 125 commits. alpha.0 therefore
+# sorts correctly below every published upstream 0.150 alpha without claiming
+# content we do not have; +haus marks this as the local fork build.
+version = "0.150.0-alpha.0+haus"
 # Track the edition for all workspace crates in one place. Individual
 # crates can still override this value, but keeping it here means new
 # crates created with `cargo new -w ...` automatically inherit the 2024
