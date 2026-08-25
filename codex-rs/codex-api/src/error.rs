@@ -12,6 +12,8 @@ pub enum ApiError {
     Api { status: StatusCode, message: String },
     #[error("stream error: {0}")]
     Stream(String),
+    #[error("model output token limit reached")]
+    OutputTokenLimitExceeded { output_tokens: Option<i64> },
     #[error("context window exceeded")]
     ContextWindowExceeded,
     #[error("quota exceeded")]

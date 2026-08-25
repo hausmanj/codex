@@ -7,6 +7,7 @@ use crate::protocol::v2::CollabAgentState;
 use crate::protocol::v2::CollabAgentTool;
 use crate::protocol::v2::CollabAgentToolCallStatus;
 use crate::protocol::v2::CommandExecutionOutputDeltaNotification;
+use crate::protocol::v2::ContextCompactionProgressNotification;
 use crate::protocol::v2::DynamicToolCallOutputContentItem;
 use crate::protocol::v2::DynamicToolCallStatus;
 use crate::protocol::v2::FileChangePatchUpdatedNotification;
@@ -382,6 +383,18 @@ pub fn item_event_to_server_notification(
                 item_id: event.item_id,
                 delta: event.delta,
                 summary_index: event.summary_index,
+            })
+        }
+        EventMsg::ContextCompactionProgress(event) => {
+            ServerNotification::ContextCompactionProgress(ContextCompactionProgressNotification {
+                thread_id,
+                turn_id,
+                item_id: event.item_id,
+                phase: event.phase.into(),
+                attempt: event.attempt,
+                output_bytes: event.output_bytes,
+                output_chunks: event.output_chunks,
+                output_tokens: event.output_tokens,
             })
         }
         EventMsg::ReasoningRawContentDelta(event) => {

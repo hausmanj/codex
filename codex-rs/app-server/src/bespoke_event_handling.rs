@@ -906,6 +906,7 @@ pub(crate) async fn apply_bespoke_event_handling(
         }
         msg @ (EventMsg::AgentMessageContentDelta(_)
         | EventMsg::PlanDelta(_)
+        | EventMsg::ContextCompactionProgress(_)
         | EventMsg::ReasoningContentDelta(_)
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::AgentReasoningSectionBreak(_)) => {

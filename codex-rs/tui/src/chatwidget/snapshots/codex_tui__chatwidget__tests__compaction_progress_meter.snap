@@ -1,0 +1,5 @@
+---
+source: tui/src/chatwidget/tests/app_server.rs
+expression: details
+---
+[█████▌··············] 5632 bytes received · 17 chunks · attempt 1 · 1 block = 1 KiB

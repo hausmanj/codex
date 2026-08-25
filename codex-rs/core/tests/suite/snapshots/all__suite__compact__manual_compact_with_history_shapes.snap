@@ -1,5 +1,6 @@
 ---
 source: core/tests/suite/compact.rs
+assertion_line: 4169
 expression: "format_labeled_requests_snapshot(\"Manual /compact with prior user history compacts existing history and the follow-up turn includes the compact summary plus new user message.\",\n&[(\"Local Compaction Request\", &requests[1]),\n(\"Local Post-Compaction History Layout\", &requests[2]),])"
 ---
 Scenario: Manual /compact with prior user history compacts existing history and the follow-up turn includes the compact summary plus new user message.
@@ -13,7 +14,7 @@ Scenario: Manual /compact with prior user history compacts existing history and 
 
 ## Local Post-Compaction History Layout
 00:message/user:first manual turn
-01:message/user:<COMPACTION_SUMMARY>\nFIRST_MANUAL_SUMMARY
+01:message/user:<COMPACTION_SUMMARY>\nFIRST_MANUAL_SUMMARY\n\n<compaction_execut...
 02:message/developer:<PERMISSIONS_INSTRUCTIONS>
 03:message/user:<ENVIRONMENT_CONTEXT:cwd=<CWD>>
 04:message/user:second manual turn

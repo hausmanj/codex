@@ -5386,6 +5386,26 @@
           "properties": {
             "method": {
               "enum": [
+                "item/contextCompaction/progress"
+              ],
+              "title": "Item/contextCompaction/progressNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ContextCompactionProgressNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Item/contextCompaction/progressNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "item/reasoning/summaryPartAdded"
               ],
               "title": "Item/reasoning/summaryPartAddedNotificationMethod",
@@ -10065,6 +10085,63 @@
         ],
         "title": "ContextCompactedNotification",
         "type": "object"
+      },
+      "ContextCompactionProgressNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "attempt": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "itemId": {
+            "type": "string"
+          },
+          "outputBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "outputChunks": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "outputTokens": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "phase": {
+            "$ref": "#/definitions/v2/ContextCompactionProgressPhase"
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "turnId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "attempt",
+          "itemId",
+          "outputBytes",
+          "outputChunks",
+          "phase",
+          "threadId",
+          "turnId"
+        ],
+        "title": "ContextCompactionProgressNotification",
+        "type": "object"
+      },
+      "ContextCompactionProgressPhase": {
+        "enum": [
+          "generating",
+          "finalizing"
+        ],
+        "type": "string"
       },
       "ConversationTextRole": {
         "enum": [

@@ -92,6 +92,11 @@ pub enum CodexErrorDetails {
     #[error("stream disconnected before completion: {0}")]
     Stream(String),
     #[error(
+        "model output token limit reached{suffix}",
+        suffix = output_tokens.map(|tokens| format!(" after {tokens} tokens")).unwrap_or_default()
+    )]
+    OutputTokenLimitExceeded { output_tokens: Option<i64> },
+    #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
     ContextWindowExceeded,
@@ -379,6 +384,7 @@ impl CodexErr {
             | CodexErrorDetails::LandlockSandboxExecutableNotProvided
             | CodexErrorDetails::RetryLimit(_)
             | CodexErrorDetails::ContextWindowExceeded
+            | CodexErrorDetails::OutputTokenLimitExceeded { .. }
             | CodexErrorDetails::ThreadNotFound(_)
             | CodexErrorDetails::AgentLimitReached { .. }
             | CodexErrorDetails::Spawn

@@ -12,6 +12,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context::ExplicitTaskCompletionReminder;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::drain_async_hook_results;
@@ -43,7 +44,6 @@ use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
 use crate::stream_events_utils::handle_non_tool_response_item;
 use crate::stream_events_utils::handle_output_item_done;
-use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
@@ -288,6 +288,10 @@ pub(crate) async fn run_turn(
     // empty completion with no tool call before the turn gives up.
     const MAX_EMPTY_COMPLETION_RETRIES: u32 = 1;
     let mut empty_completion_retries: u32 = 0;
+    // Bound non-compliant terminal retries without limiting productive tool
+    // continuations inside the same turn.
+    const MAX_MISSING_TASK_COMPLETION_RETRIES: u32 = 3;
+    let mut missing_task_completion_retries: u32 = 0;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(
@@ -398,12 +402,31 @@ pub(crate) async fn run_turn(
         match sampling_request_result {
             Ok((sampling_request_output, sampling_request_input)) => {
                 let SamplingRequestResult {
-                    needs_follow_up: model_needs_follow_up,
-                    last_agent_message: sampling_request_last_agent_message,
+                    needs_follow_up: mut model_needs_follow_up,
+                    last_agent_message: mut sampling_request_last_agent_message,
                     produced_output,
                     saw_blank_message,
                 } = sampling_request_output;
+                if step_context
+                    .turn
+                    .config
+                    .features
+                    .enabled(Feature::ExplicitTaskCompletion)
+                    && let Some(completion) = explicit_task_completion(&sess).await
+                {
+                    trace!(
+                        turn_id = %turn_context.sub_id,
+                        status = ?completion.status,
+                        "accepted explicit task completion"
+                    );
+                    model_needs_follow_up = false;
+                    sampling_request_last_agent_message = Some(completion.final_message);
+                }
                 if model_needs_follow_up {
+                    // A tool call is concrete progress. Completion retries guard
+                    // consecutive message-only stops, not the total number of
+                    // work phases in a long-running turn.
+                    missing_task_completion_retries = 0;
                     sess.input_queue
                         .accept_mailbox_delivery_for_current_turn(
                             &sess.active_turn,
@@ -545,6 +568,46 @@ pub(crate) async fn run_turn(
                 }
 
                 if !needs_follow_up {
+                    if step_context
+                        .turn
+                        .config
+                        .features
+                        .enabled(Feature::ExplicitTaskCompletion)
+                        && explicit_task_completion(&sess).await.is_none()
+                    {
+                        if missing_task_completion_retries < MAX_MISSING_TASK_COMPLETION_RETRIES {
+                            missing_task_completion_retries += 1;
+                            warn!(
+                                turn_id = %turn_context.sub_id,
+                                attempt = missing_task_completion_retries,
+                                "turn ended without explicit task completion; resampling"
+                            );
+                            if let Some(reminder) =
+                                crate::context_manager::updates::build_rendered_message(vec![
+                                    ExplicitTaskCompletionReminder.render_fragment(),
+                                ])
+                            {
+                                sess.record_response_item_and_emit_turn_item(
+                                    &turn_context,
+                                    reminder,
+                                )
+                                .await;
+                            }
+                            continue;
+                        }
+                        warn!(
+                            turn_id = %turn_context.sub_id,
+                            "model ignored the explicit task completion contract repeatedly; ending turn"
+                        );
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent {
+                                message: "The model repeatedly ended a response without declaring the task completed or blocked. The safety retry limit was reached."
+                                    .to_string(),
+                            }),
+                        )
+                        .await;
+                    }
                     last_agent_message = sampling_request_last_agent_message;
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
@@ -1369,6 +1432,7 @@ pub(crate) fn build_prompt(
         input,
         tools: step_context.tool_router.model_visible_specs(),
         parallel_tool_calls: true,
+        max_output_tokens: turn_context.config.model_max_output_tokens,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
         output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
@@ -1469,6 +1533,18 @@ async fn run_sampling_request(
 
         if original_input.is_none() {
             original_input = Some(prompt.input);
+        }
+
+        if matches!(
+            err.details(),
+            CodexErrorDetails::OutputTokenLimitExceeded { .. }
+        ) {
+            sess.services
+                .repeat_call_guard
+                .lock()
+                .await
+                .mark_output_token_limit_stall();
+            return Err(err);
         }
 
         if !err.is_retryable() {
@@ -1632,6 +1708,14 @@ struct SamplingRequestResult {
     /// a response with no items at all, which is an ordinary way for a turn to
     /// end and must not be resampled.
     saw_blank_message: bool,
+}
+
+async fn explicit_task_completion(sess: &Session) -> Option<crate::state::ExplicitTaskCompletion> {
+    let turn_state = {
+        let active_turn = sess.active_turn.lock().await;
+        Arc::clone(&active_turn.as_ref()?.turn_state)
+    };
+    turn_state.lock().await.explicit_task_completion().cloned()
 }
 
 /// Whether a completed output item represents real model output.
@@ -1860,6 +1944,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::SafetyBuffering(_)
         | EventMsg::ContextCompacted(_)
+        | EventMsg::ContextCompactionProgress(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::ThreadSettingsApplied(_)
@@ -2966,17 +3051,6 @@ async fn try_run_sampling_request(
     }
 
     outcome
-}
-
-pub(crate) fn get_last_assistant_message_from_turn<'a>(
-    responses: impl DoubleEndedIterator<Item = &'a ResponseItem>,
-) -> Option<String> {
-    for item in responses.rev() {
-        if let Some(message) = last_assistant_message_from_item(item, /*plan_mode*/ false) {
-            return Some(message);
-        }
-    }
-    None
 }
 
 #[cfg(test)]

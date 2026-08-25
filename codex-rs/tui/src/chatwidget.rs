@@ -619,8 +619,7 @@ pub(crate) struct ChatWidget {
     task_complete_pending: bool,
     /// Live progress for an in-flight compaction, or `None` when compaction is not running.
     ///
-    /// Compaction streams reasoning/summary deltas but must not write them to the transcript,
-    /// so they are accumulated here and surfaced through the status indicator instead.
+    /// Typed compaction telemetry is accumulated here and surfaced through the status indicator.
     compaction_progress: Option<CompactionProgress>,
     /// Proof-of-life for the in-flight sampling request; see [`turn_progress`].
     turn_progress: Option<TurnProgress>,

@@ -47,15 +47,15 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    /// Records a chunk of the compaction stream and refreshes the status line.
-    ///
-    /// The summary itself is internal bookkeeping, so it is deliberately kept out of the
-    /// transcript; the user needs evidence of forward motion, not the text.
-    pub(super) fn on_context_compaction_progress(&mut self, delta: &str) {
+    /// Records measured compaction telemetry and refreshes the status line.
+    pub(super) fn on_context_compaction_progress(
+        &mut self,
+        notification: codex_app_server_protocol::ContextCompactionProgressNotification,
+    ) {
         let Some(progress) = self.compaction_progress.as_mut() else {
             return;
         };
-        progress.record(delta);
+        progress.update(notification);
         self.render_compaction_progress();
     }
 
@@ -325,45 +325,71 @@ impl ChatWidget {
     }
 }
 
-/// Accumulated progress for an in-flight compaction.
-///
-/// Tracks only what the status line needs: how much the model has produced so far and the tail
-/// of that output, so a long summarization reads as active work rather than a frozen UI.
+/// Measured progress for an in-flight compaction.
 #[derive(Default)]
 pub(super) struct CompactionProgress {
-    approx_chars: usize,
-    tail: String,
+    phase: Option<codex_app_server_protocol::ContextCompactionProgressPhase>,
+    attempt: u32,
+    output_bytes: u64,
+    output_chunks: u64,
+    output_tokens: Option<i64>,
 }
 
-/// Characters of streamed output kept for the status line.
-const COMPACTION_TAIL_CHARS: usize = 160;
-
-/// Rough characters-per-token ratio. This drives a progress readout, not accounting, so a
-/// cheap approximation is sufficient and avoids pulling a tokenizer into the TUI.
-const COMPACTION_CHARS_PER_TOKEN: usize = 4;
+const COMPACTION_METER_CELLS: usize = 20;
+const COMPACTION_BYTES_PER_CELL: u64 = 1024;
+const COMPACTION_BYTES_PER_PARTIAL_CELL: u64 = COMPACTION_BYTES_PER_CELL / 8;
+const PARTIAL_BLOCKS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 
 impl CompactionProgress {
-    fn record(&mut self, delta: &str) {
-        self.approx_chars = self.approx_chars.saturating_add(delta.chars().count());
-        self.tail.push_str(&delta.replace('\n', " "));
-        // Keep the buffer bounded; a summary can run to thousands of tokens.
-        let excess = self
-            .tail
-            .chars()
-            .count()
-            .saturating_sub(COMPACTION_TAIL_CHARS);
-        if excess > 0 {
-            self.tail = self.tail.chars().skip(excess).collect();
-        }
+    fn update(
+        &mut self,
+        notification: codex_app_server_protocol::ContextCompactionProgressNotification,
+    ) {
+        self.phase = Some(notification.phase);
+        self.attempt = notification.attempt;
+        self.output_bytes = notification.output_bytes;
+        self.output_chunks = notification.output_chunks;
+        self.output_tokens = notification.output_tokens;
     }
 
     fn status_details(&self) -> String {
-        let approx_tokens = self.approx_chars / COMPACTION_CHARS_PER_TOKEN;
-        let tail = self.tail.trim();
-        if tail.is_empty() {
-            format!("~{approx_tokens} tokens generated")
-        } else {
-            format!("~{approx_tokens} tokens · {tail}")
+        let meter = self.output_meter();
+        match self.phase {
+            None => format!("{meter} waiting for first model output · 1 block = 1 KiB"),
+            Some(codex_app_server_protocol::ContextCompactionProgressPhase::Generating) => {
+                format!(
+                    "{meter} {} bytes received · {} chunks · attempt {} · 1 block = 1 KiB",
+                    self.output_bytes, self.output_chunks, self.attempt
+                )
+            }
+            Some(codex_app_server_protocol::ContextCompactionProgressPhase::Finalizing) => {
+                let output = self.output_tokens.map_or_else(
+                    || "model response complete".to_string(),
+                    |tokens| format!("{tokens} output tokens"),
+                );
+                format!(
+                    "[{}] {output} · installing compacted context",
+                    "█".repeat(COMPACTION_METER_CELLS)
+                )
+            }
         }
+    }
+
+    fn output_meter(&self) -> String {
+        let full_cells = usize::try_from(self.output_bytes / COMPACTION_BYTES_PER_CELL)
+            .unwrap_or(usize::MAX)
+            .min(COMPACTION_METER_CELLS);
+        let mut cells = "█".repeat(full_cells);
+        if full_cells < COMPACTION_METER_CELLS {
+            let partial_index = usize::try_from(
+                (self.output_bytes % COMPACTION_BYTES_PER_CELL) / COMPACTION_BYTES_PER_PARTIAL_CELL,
+            )
+            .unwrap_or(0);
+            if partial_index > 0 {
+                cells.push(PARTIAL_BLOCKS[partial_index]);
+            }
+            cells.push_str(&"·".repeat(COMPACTION_METER_CELLS - cells.chars().count()));
+        }
+        format!("[{cells}]")
     }
 }

@@ -7926,6 +7926,44 @@ async fn for_config_writes_selected_user_config_file() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `codex --profile <name>` (e.g. the `mlx` CodexLocal profile) resolves to
+/// `LoaderOverrides { user_config_path: <name>.config.toml, user_config_profile:
+/// Some(<name>) }` (see `cli/src/main.rs::loader_overrides_for_profile_at_codex_home`).
+/// This exercises that exact mechanism end-to-end to prove
+/// `compact_model_reasoning_effort` set in a profile file (not the base
+/// `config.toml`) actually reaches the runtime `Config`, and is independent
+/// from `model_reasoning_effort`.
+#[tokio::test]
+async fn profile_v2_config_file_carries_compact_model_reasoning_effort() -> anyhow::Result<()> {
+    let codex_home = TempDir::new()?;
+    let base_config = codex_home.path().join(CONFIG_TOML_FILE);
+    let profile_config = codex_home.path().join("mlx.config.toml");
+    tokio::fs::write(&base_config, r#"model_provider = "openai""#).await?;
+    tokio::fs::write(
+        &profile_config,
+        r#"
+model_reasoning_effort = "medium"
+compact_model_reasoning_effort = "low"
+"#,
+    )
+    .await?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides {
+            user_config_path: Some(profile_config.abs()),
+            user_config_profile: Some("mlx".parse().expect("profile-v2 name")),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+
+    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::Medium));
+    assert_eq!(config.compact_model_reasoning_effort, Some(ReasoningEffort::Low));
+
+    Ok(())
+}
+
 #[test]
 fn profile_v2_config_path_resolves_validated_names() -> anyhow::Result<()> {
     let codex_home = TempDir::new()?;

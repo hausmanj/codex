@@ -81,14 +81,11 @@ impl ChatWidget {
             }
             ServerNotification::PlanDelta(notification) => self.on_plan_delta(notification.delta),
             ServerNotification::ReasoningSummaryTextDelta(notification) => {
-                // Compaction reuses this channel to report summarization progress. Route it to
-                // the compaction status so it never lands in the transcript as model reasoning.
-                if self.compaction_progress.is_some() {
-                    self.on_context_compaction_progress(&notification.delta);
-                } else {
-                    self.on_turn_progress_delta(&notification.delta);
-                    self.on_agent_reasoning_delta(notification.delta);
-                }
+                self.on_turn_progress_delta(&notification.delta);
+                self.on_agent_reasoning_delta(notification.delta);
+            }
+            ServerNotification::ContextCompactionProgress(notification) => {
+                self.on_context_compaction_progress(notification);
             }
             ServerNotification::ReasoningTextDelta(notification) => {
                 // Record progress regardless of the display setting. A model

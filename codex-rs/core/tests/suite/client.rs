@@ -3537,6 +3537,93 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn output_token_limit_is_not_retried_and_starts_bounded_continuation() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = MockServer::start().await;
+
+    let capped_response = sse(vec![
+        ev_response_created("resp_capped"),
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_capped",
+                "object": "response",
+                "status": "incomplete",
+                "error": null,
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 8000,
+                    "total_tokens": 8100
+                }
+            }
+        }),
+    ]);
+    let recovered_response = sse(vec![
+        ev_assistant_message("msg_recovered", "RECOVERED_AFTER_OUTPUT_CAP"),
+        ev_completed("resp_recovered"),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![capped_response, recovered_response]).await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_config(|config| {
+            config.model_max_output_tokens = Some(8_000);
+            config.model_provider.stream_max_retries = Some(5);
+            config
+                .repeat_guard
+                .as_mut()
+                .expect("repeat guard is enabled in test config")
+                .auto_nudge_max = 1;
+        })
+        .build(&server)
+        .await?;
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "trigger output cap".into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+
+    let error_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    assert!(
+        matches!(
+            error_event,
+            EventMsg::Error(ref err) if err.message.contains("model output token limit reached")
+        ),
+        "expected typed output-limit error; got {error_event:?}"
+    );
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::AgentMessage(message)
+                if message.message == "RECOVERED_AFTER_OUTPUT_CAP"
+        )
+    })
+    .await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "capped request must not be transport-retried"
+    );
+    for request in &requests {
+        assert_eq!(request.body_json()["max_output_tokens"], json!(8_000));
+    }
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains("configured output-token budget"),
+        "follow-up request must explain the controlled generation boundary"
+    );
+
+    Ok(())
+}
+
 /// We try to avoid setting env vars in tests because std::env::set_var() is
 /// process-wide and unsafe. Though for this test, we want to simulate the
 /// presence of an environment variable that the provider will read for auth, so

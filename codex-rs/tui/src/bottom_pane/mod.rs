@@ -56,10 +56,12 @@ use std::time::Instant;
 
 mod action_required_title;
 mod app_link_view;
+mod apply_patch_header;
 mod approval_overlay;
 mod mcp_server_elicitation;
 mod multi_select_picker;
 mod request_user_input;
+mod startup;
 mod status_line_setup;
 mod status_line_style;
 mod status_surface_preview;
@@ -194,6 +196,7 @@ pub(crate) enum CancellationEvent {
 use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
+pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
 pub(crate) use chat_composer::QueuedInputAction;
 pub(crate) use chat_composer_history::HistoryEntry;
@@ -252,6 +255,7 @@ pub(crate) struct BottomPane {
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
     keymap: RuntimeKeymap,
+    plan_mode_nudge_visible: bool,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -267,6 +271,14 @@ pub(crate) struct BottomPaneParams {
 
 impl BottomPane {
     pub fn new(params: BottomPaneParams) -> Self {
+        Self::new_with_composer_config(params, ChatComposerConfig::default())
+    }
+
+    /// Construct a bottom pane with explicitly restricted composer behavior.
+    pub(crate) fn new_with_composer_config(
+        params: BottomPaneParams,
+        composer_config: ChatComposerConfig,
+    ) -> Self {
         let BottomPaneParams {
             app_event_tx,
             frame_requester,
@@ -277,12 +289,13 @@ impl BottomPane {
             animations_enabled,
             skills,
         } = params;
-        let mut composer = ChatComposer::new(
+        let mut composer = ChatComposer::new_with_config(
             has_input_focus,
             app_event_tx.clone(),
             enhanced_keys_supported,
             placeholder_text,
             disable_paste_burst,
+            composer_config,
         );
         composer.set_frame_requester(frame_requester.clone());
         let keymap = RuntimeKeymap::defaults();
@@ -309,6 +322,7 @@ impl BottomPane {
             context_window_percent: None,
             context_window_used_tokens: None,
             keymap,
+            plan_mode_nudge_visible: false,
         }
     }
 
@@ -884,10 +898,6 @@ impl BottomPane {
         self.composer.cursor()
     }
 
-    pub(crate) fn composer_draft_snapshot(&self) -> chat_composer::ComposerDraftSnapshot {
-        self.composer.draft_snapshot()
-    }
-
     #[cfg(test)]
     pub(crate) fn composer_text_elements(&self) -> Vec<TextElement> {
         self.composer.text_elements()
@@ -927,14 +937,15 @@ impl BottomPane {
 
     /// Applies the externally decided Plan-mode nudge visibility to the footer presentation.
     pub(crate) fn set_plan_mode_nudge_visible(&mut self, visible: bool) {
-        if self.composer.set_plan_mode_nudge_visible(visible) {
+        if self.plan_mode_nudge_visible != visible {
+            self.plan_mode_nudge_visible = visible;
             self.request_redraw();
         }
     }
 
     #[cfg(test)]
     pub(crate) fn plan_mode_nudge_visible(&self) -> bool {
-        self.composer.plan_mode_nudge_visible()
+        self.plan_mode_nudge_visible
     }
 
     pub(crate) fn set_remote_image_urls(&mut self, urls: Vec<String>) {
@@ -1358,7 +1369,8 @@ impl BottomPane {
     }
 
     pub(crate) fn exit_link_contains(&self, column: u16, row: u16) -> bool {
-        self.view_stack.is_empty() && self.composer.exit_link_contains(column, row)
+        let _ = (column, row);
+        false
     }
 
     #[cfg(test)]
@@ -1434,6 +1446,30 @@ impl BottomPane {
 
     pub(crate) fn show_view(&mut self, view: Box<dyn BottomPaneView>) {
         self.push_view(view);
+    }
+
+    pub(crate) fn replace_view_if_present(
+        &mut self,
+        view_id: &'static str,
+        view: Box<dyn BottomPaneView>,
+    ) {
+        if let Some(index) = self
+            .view_stack
+            .iter()
+            .rposition(|existing| existing.view_id() == Some(view_id))
+        {
+            self.view_stack[index] = view;
+            self.request_redraw();
+        }
+    }
+
+    /// Show a text prompt with the composer's current editing preferences.
+    pub(crate) fn show_text_prompt(&mut self, mut view: custom_prompt_view::CustomPromptView) {
+        view.set_keymap_bindings(&self.keymap);
+        if self.composer.is_vim_enabled() {
+            view.enable_vim_in_insert_mode();
+        }
+        self.push_view(Box::new(view));
     }
 
     /// Called when the agent requests user approval.

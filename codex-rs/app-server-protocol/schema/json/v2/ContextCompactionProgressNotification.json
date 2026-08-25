@@ -1,0 +1,59 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ContextCompactionProgressPhase": {
+      "enum": [
+        "generating",
+        "finalizing"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "attempt": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "itemId": {
+      "type": "string"
+    },
+    "outputBytes": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "outputChunks": {
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "outputTokens": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "phase": {
+      "$ref": "#/definitions/ContextCompactionProgressPhase"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "attempt",
+    "itemId",
+    "outputBytes",
+    "outputChunks",
+    "phase",
+    "threadId",
+    "turnId"
+  ],
+  "title": "ContextCompactionProgressNotification",
+  "type": "object"
+}

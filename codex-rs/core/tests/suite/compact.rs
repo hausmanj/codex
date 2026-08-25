@@ -19,7 +19,10 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::ContextCompactionProgressEvent;
+use codex_protocol::protocol::ContextCompactionProgressPhase;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookRunStatus;
@@ -53,6 +56,7 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
+use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_compact_response_sequence;
 use core_test_support::responses::mount_response_sequence;
@@ -647,10 +651,12 @@ async fn summarize_context_three_requests_and_instructions() {
             .any(|(r, t)| r == "user" && t == "hello world"),
         "third request should include the original user message"
     );
+    // As above: the summary is followed by a non-deterministic
+    // `<compaction_execution_cursor>` tail, so match on prefix rather than equality.
     assert!(
         messages
             .iter()
-            .any(|(r, t)| r == "user" && t == &expected_summary_message),
+            .any(|(r, t)| r == "user" && t.starts_with(expected_summary_message.as_str())),
         "third request should include the summary message"
     );
     assert!(
@@ -681,7 +687,7 @@ async fn summarize_context_three_requests_and_instructions() {
             RolloutItem::TurnContext(_) => {
                 regular_turn_context_count += 1;
             }
-            RolloutItem::Compacted(ci) if ci.message == expected_summary_message => {
+            RolloutItem::Compacted(ci) if ci.message.starts_with(&expected_summary_message) => {
                 saw_compacted_summary = true;
             }
             _ => {}
@@ -915,6 +921,146 @@ async fn manual_compact_uses_custom_prompt() {
     }
 }
 
+/// Strips the `<compaction_execution_cursor>` tail (see
+/// context::compaction_execution_cursor) that gets appended to a compacted summary.
+/// That tail embeds per-run turn_id/create_time metadata for tool-call entries, so it
+/// is not stable across runs; tests comparing summary text should compare against
+/// this rather than the raw text.
+fn strip_execution_cursor_tail(text: &str) -> &str {
+    text.split("<compaction_execution_cursor>")
+        .next()
+        .unwrap_or(text)
+        .trim_end_matches('\n')
+}
+
+fn request_reasoning_effort(request: &core_test_support::responses::ResponsesRequest) -> Option<String> {
+    request
+        .body_json()
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_uses_compact_model_reasoning_effort_override() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m0", FIRST_REPLY),
+        ev_completed_with_tokens("r0", /*total_tokens*/ 80),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m1", SUMMARY_TEXT),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        // Normal turns must keep the configured medium effort ...
+        config.model_reasoning_effort = Some(ReasoningEffort::Medium);
+        // ... while compaction uses its own, cheaper effort instead.
+        config.compact_model_reasoning_effort = Some(ReasoningEffort::Low);
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected first turn and compact requests"
+    );
+    assert_eq!(
+        request_reasoning_effort(&requests[0]).as_deref(),
+        Some("medium"),
+        "normal turn should keep the configured medium reasoning effort"
+    );
+    assert_eq!(
+        request_reasoning_effort(&requests[1]).as_deref(),
+        Some("low"),
+        "compaction should use compact_model_reasoning_effort instead of the normal effort"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_falls_back_to_model_reasoning_effort_when_unset() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message("m0", FIRST_REPLY),
+        ev_completed_with_tokens("r0", /*total_tokens*/ 80),
+    ]);
+    let compact_turn = sse(vec![
+        ev_assistant_message("m1", SUMMARY_TEXT),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 100),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![first_turn, compact_turn]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        config.model_reasoning_effort = Some(ReasoningEffort::High);
+        // compact_model_reasoning_effort left unset: compaction must fall
+        // back to the normal reasoning effort rather than using a default.
+        config.compact_model_reasoning_effort = None;
+    });
+    let codex = builder
+        .build(&server)
+        .await
+        .expect("create conversation")
+        .codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "USER_ONE".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .expect("submit first user turn");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected first turn and compact requests"
+    );
+    assert_eq!(
+        request_reasoning_effort(&requests[0]).as_deref(),
+        Some("high"),
+    );
+    assert_eq!(
+        request_reasoning_effort(&requests[1]).as_deref(),
+        Some("high"),
+        "compaction should fall back to the normal reasoning effort when unset"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_emits_api_and_local_token_usage_events() {
     skip_if_no_network!();
@@ -970,6 +1116,90 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
     assert!(
         last > 0,
         "second TokenCount should reflect a non-zero estimated context size after compaction"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_reports_measured_stream_progress_and_final_tokens() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let completed = json!({
+        "type": "response.completed",
+        "response": {
+            "id": "r1",
+            "usage": {
+                "input_tokens": 100,
+                "input_tokens_details": null,
+                "output_tokens": 7,
+                "output_tokens_details": null,
+                "total_tokens": 107
+            }
+        }
+    });
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_output_text_delta("abc"),
+            ev_output_text_delta("dé"),
+            ev_assistant_message("m1", SUMMARY_TEXT),
+            completed,
+        ]),
+    )
+    .await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let codex = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+        })
+        .build(&server)
+        .await
+        .expect("build codex")
+        .codex;
+
+    codex.submit(Op::Compact).await.expect("submit compact");
+    let mut progress = Vec::new();
+    loop {
+        let event = codex.next_event().await.expect("next event");
+        match event.msg {
+            EventMsg::ContextCompactionProgress(event) => progress.push(event),
+            EventMsg::TurnComplete(_) => break,
+            EventMsg::Error(error) => panic!("unexpected compaction error: {error:?}"),
+            _ => {}
+        }
+    }
+
+    let item_id = progress.first().expect("progress event").item_id.clone();
+    assert_eq!(
+        progress,
+        vec![
+            ContextCompactionProgressEvent {
+                item_id: item_id.clone(),
+                phase: ContextCompactionProgressPhase::Generating,
+                attempt: 1,
+                output_bytes: 3,
+                output_chunks: 1,
+                output_tokens: None,
+            },
+            ContextCompactionProgressEvent {
+                item_id: item_id.clone(),
+                phase: ContextCompactionProgressPhase::Generating,
+                attempt: 1,
+                output_bytes: 6,
+                output_chunks: 2,
+                output_tokens: None,
+            },
+            ContextCompactionProgressEvent {
+                item_id,
+                phase: ContextCompactionProgressPhase::Finalizing,
+                attempt: 1,
+                output_bytes: 6,
+                output_chunks: 2,
+                output_tokens: Some(7),
+            },
+        ]
     );
 }
 
@@ -1185,7 +1415,15 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
                     .and_then(|text| text.as_str())
                     .is_some_and(|text| text.starts_with("# AGENTS.md instructions"))
             })
-            .cloned()
+            .map(|item| {
+                let Some(text) = item.get("text").and_then(|text| text.as_str()) else {
+                    return item.clone();
+                };
+                let mut item = item.clone();
+                item["text"] =
+                    serde_json::Value::String(strip_execution_cursor_tail(text).to_string());
+                item
+            })
             .collect::<Vec<_>>();
         if filtered_content.is_empty() {
             return None;
@@ -1253,9 +1491,14 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
         let summary_message = input[2]["content"][0]["text"].as_str().unwrap();
         assert_eq!(environment_message, environment_message);
         assert_eq!(user_message_received, user_message);
-        assert_eq!(
-            summary_message, expected_summary,
-            "compaction request at index {i} should include the prefixed summary"
+        // The compacted summary is followed by a `<compaction_execution_cursor>` tail
+        // recording the execution boundary immediately before compaction (see
+        // context::compaction_execution_cursor). That tail embeds per-run
+        // turn_id/create_time metadata, so it cannot be pinned to an exact string;
+        // check the summary prefix instead of full equality.
+        assert!(
+            summary_message.starts_with(expected_summary),
+            "compaction request at index {i} should include the prefixed summary, got `{summary_message}`"
         );
     }
 
@@ -1769,6 +2012,99 @@ async fn auto_compact_runs_after_token_limit_hit() {
             .any(|text| text.contains(prefixed_auto_summary)),
         "auto compact follow-up request should include the summary message"
     );
+}
+
+// The reported symptom (an 18-minute compaction) was auto-compaction firing
+// mid-session on a token-limit trip, not a manual `Op::Compact`. This proves
+// the compact_model_reasoning_effort override reaches that path too, since it
+// shares drain_to_completed / run_remote_compact_attempt with manual compact
+// but is triggered independently -- see auto_compact_runs_after_token_limit_hit
+// above for the request-shape this borrows (4 requests: 2 turns, auto compact
+// at index 2, follow-up turn last).
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn auto_compact_uses_compact_model_reasoning_effort_override() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", "SECOND_REPLY"),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
+    ]);
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+    ]);
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", FINAL_REPLY),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
+    ]);
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200_000);
+        config.model_reasoning_effort = Some(ReasoningEffort::Medium);
+        config.compact_model_reasoning_effort = Some(ReasoningEffort::Low);
+    });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: FIRST_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: SECOND_AUTO_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: POST_AUTO_USER_MSG.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 4, "expected 2 turns, auto compact, follow-up");
+
+    let auto_compact_index = requests
+        .iter()
+        .enumerate()
+        .find_map(|(idx, req)| {
+            body_contains_text(&req.body_json().to_string(), SUMMARIZATION_PROMPT)
+                .then_some(idx)
+        })
+        .expect("auto compact request missing");
+    assert_eq!(auto_compact_index, 2, "auto compact should be the third request");
+
+    for (idx, request) in requests.iter().enumerate() {
+        let expected = if idx == auto_compact_index { "low" } else { "medium" };
+        assert_eq!(
+            request_reasoning_effort(request).as_deref(),
+            Some(expected),
+            "request {idx} should use effort {expected:?}"
+        );
+    }
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -3909,7 +4245,13 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
         second_user_message.to_string(),
         expected_second_summary,
     ];
-    assert_eq!(history_before_seeded_prefix, expected_history.as_slice());
+    // The compacted summary (last entry) carries a `<compaction_execution_cursor>`
+    // tail; strip it before comparing since it isn't part of the model's summary.
+    let history_before_seeded_prefix: Vec<String> = history_before_seeded_prefix
+        .iter()
+        .map(|text| strip_execution_cursor_tail(text).to_string())
+        .collect();
+    assert_eq!(history_before_seeded_prefix, expected_history);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5355,4 +5697,87 @@ async fn auto_compact_request_advertises_same_tools_as_sampling_request() {
         "compaction request must advertise the same tools as the sampling request so the two \
          share a prompt prefix"
     );
+}
+
+/// A tool-enabled compaction response can try to continue the task instead of producing a
+/// handoff. The retry must use only output from the current compaction attempt, while the
+/// deterministic execution cursor independently retains the real pre-compaction tool boundary.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn auto_compact_retries_tool_free_after_tool_call_instead_of_reusing_old_text() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let valid_summary = "CURRENT_COMPACTION_HANDOFF";
+    let responses = vec![
+        sse(vec![
+            ev_assistant_message("m1", FIRST_REPLY),
+            ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+        ]),
+        sse(vec![
+            ev_assistant_message("m2", "OLD_WORK_NARRATION"),
+            ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
+        ]),
+        sse(vec![
+            ev_assistant_message("m3", ""),
+            ev_exec_command_call("compact-shell", "echo keep-working"),
+            ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+        ]),
+        sse(vec![
+            ev_assistant_message("m4", valid_summary),
+            ev_completed_with_tokens("r4", /*total_tokens*/ 200),
+        ]),
+        sse(vec![
+            ev_assistant_message("m5", FINAL_REPLY),
+            ev_completed_with_tokens("r5", /*total_tokens*/ 120),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+    let model_provider = non_openai_model_provider(&server);
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        config.model_auto_compact_token_limit = Some(200_000);
+    });
+    let codex = builder.build(&server).await.unwrap().codex;
+
+    for text in [FIRST_AUTO_MSG, SECOND_AUTO_MSG, POST_AUTO_USER_MSG] {
+        codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: text.into(),
+                text_elements: Vec::new(),
+            }]))
+            .await
+            .unwrap();
+        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    }
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 5);
+    let compact_requests = requests
+        .iter()
+        .filter(|request| {
+            body_contains_text(&request.body_json().to_string(), SUMMARIZATION_PROMPT)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compact_requests.len(), 2);
+    assert!(
+        compact_requests[0]
+            .body_json()
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert!(
+        compact_requests[1]
+            .body_json()
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    );
+
+    let post_compact_body = requests[4].body_json().to_string();
+    assert!(post_compact_body.contains(valid_summary));
+    assert!(post_compact_body.contains("<compaction_execution_cursor>"));
+    assert!(post_compact_body.contains("OLD_WORK_NARRATION"));
 }

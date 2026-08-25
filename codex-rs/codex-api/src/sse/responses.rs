@@ -451,13 +451,23 @@ pub fn process_responses_event(
             )));
         }
         "response.incomplete" => {
-            let reason = event.response.as_ref().and_then(|response| {
+            let response = event.response.as_ref();
+            let reason = response.and_then(|response| {
                 response
                     .get("incomplete_details")
                     .and_then(|details| details.get("reason"))
                     .and_then(Value::as_str)
             });
             let reason = reason.unwrap_or("unknown");
+            if reason == "max_output_tokens" {
+                let output_tokens = response
+                    .and_then(|response| response.get("usage"))
+                    .and_then(|usage| usage.get("output_tokens"))
+                    .and_then(Value::as_i64);
+                return Err(ResponsesEventError::Api(
+                    ApiError::OutputTokenLimitExceeded { output_tokens },
+                ));
+            }
             let message = format!("Incomplete response returned, reason: {reason}");
             return Err(ResponsesEventError::Api(ApiError::Stream(message)));
         }
@@ -482,14 +492,13 @@ pub fn process_responses_event(
                         .get("usage")
                         .and_then(|usage| usage.get("output_tokens"))
                         .and_then(Value::as_i64);
-                    let generated = match output_tokens {
-                        Some(tokens) => format!(" after generating {tokens} output tokens"),
-                        None => String::new(),
-                    };
+                    if reason == "max_output_tokens" {
+                        return Err(ResponsesEventError::Api(
+                            ApiError::OutputTokenLimitExceeded { output_tokens },
+                        ));
+                    }
                     return Err(ResponsesEventError::Api(ApiError::Stream(format!(
-                        "Incomplete response returned, reason: {reason}{generated}. \
-                         The provider truncated this generation; if it stops at the same \
-                         token count every time, raise the server's max-tokens limit."
+                        "Incomplete response returned, reason: {reason}"
                     ))));
                 }
                 match serde_json::from_value::<ResponseCompleted>(resp_val) {
@@ -1214,15 +1223,8 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            Err(ApiError::Stream(message)) => {
-                assert!(
-                    message.contains("max_output_tokens"),
-                    "truncation reason must survive: {message}"
-                );
-                assert!(
-                    message.contains("512"),
-                    "the output-token count is what identifies a max-token cap: {message}"
-                );
+            Err(ApiError::OutputTokenLimitExceeded { output_tokens }) => {
+                assert_eq!(*output_tokens, Some(512));
             }
             other => panic!("unexpected event: {other:?}"),
         }

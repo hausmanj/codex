@@ -1,5 +1,6 @@
 ---
 source: core/tests/suite/compact.rs
+assertion_line: 5137
 expression: "format_labeled_requests_snapshot(\"Pre-turn compaction during model switch (without pre-sampling model-switch compaction): current behavior strips incoming <model_switch> from the compact request and restores it in the post-compaction follow-up request.\",\n&[(\"Initial Request (Previous Model)\", &requests[0]),\n(\"Local Compaction Request\", &requests[1]),\n(\"Local Post-Compaction History Layout\", &requests[2]),])"
 ---
 Scenario: Pre-turn compaction during model switch (without pre-sampling model-switch compaction): current behavior strips incoming <model_switch> from the compact request and restores it in the post-compaction follow-up request.
@@ -18,7 +19,7 @@ Scenario: Pre-turn compaction during model switch (without pre-sampling model-sw
 
 ## Local Post-Compaction History Layout
 00:message/user:BEFORE_SWITCH_USER
-01:message/user:<COMPACTION_SUMMARY>\nPRETURN_SWITCH_SUMMARY
+01:message/user:<COMPACTION_SUMMARY>\nPRETURN_SWITCH_SUMMARY\n\n<compaction_exec...
 02:message/developer[2]:
     [01] <model_switch>\nThe user was previously using a different model....
     [02] <PERMISSIONS_INSTRUCTIONS>

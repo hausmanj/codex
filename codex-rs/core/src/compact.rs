@@ -4,6 +4,8 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::context::CompactionExecutionCursor;
+use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -16,9 +18,9 @@ use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
-use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
 use crate::state::AutoCompactWindowIds;
+use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::util::backoff;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
@@ -40,9 +42,10 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ContextCompactionProgressEvent;
+use codex_protocol::protocol::ContextCompactionProgressPhase;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RawResponseCompletedEvent;
-use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -264,6 +267,11 @@ async fn run_compact_task_inner_impl(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
+    // Capture the real execution boundary before adding the synthetic compaction prompt. The
+    // model summary supplies broad context; this cursor independently preserves concrete lifecycle
+    // state such as the latest tool call and its result.
+    let execution_cursor =
+        CompactionExecutionCursor::from_history(history.raw_items()).map(|cursor| cursor.render());
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.model_info.truncation_policy.into(),
@@ -291,8 +299,9 @@ async fn run_compact_task_inner_impl(
     // without tools and ~99% with them, which on a full window is the difference between a
     // multi-minute stall and a few seconds.
     let mut request_tools = tools;
+    let mut progress_attempt = 0_u32;
     let summary_suffix = loop {
-        loop {
+        let attempt_output = loop {
             // Clone is required because of the loop
             let turn_input = history
                 .clone()
@@ -303,9 +312,11 @@ async fn run_compact_task_inner_impl(
                 tools: Arc::clone(&request_tools),
                 // Match the sampling request's value so the request bodies stay comparable.
                 parallel_tool_calls: !request_tools.is_empty(),
+                max_output_tokens: turn_context.config.model_max_output_tokens,
                 base_instructions: sess.get_base_instructions().await,
                 ..Default::default()
             };
+            progress_attempt = progress_attempt.saturating_add(1);
             let attempt_result = drain_to_completed(
                 &sess,
                 turn_context.as_ref(),
@@ -313,13 +324,12 @@ async fn run_compact_task_inner_impl(
                 &responses_metadata,
                 &prompt,
                 &compaction_item_id,
+                progress_attempt,
             )
             .await;
 
             match attempt_result {
-                Ok(()) => {
-                    break;
-                }
+                Ok(output) => break output,
                 Err(err)
                     if matches!(
                         err.details(),
@@ -370,25 +380,36 @@ async fn run_compact_task_inner_impl(
                     }
                 }
             }
-        }
+        };
 
-        let suffix = get_last_assistant_message_from_turn(sess.clone_history().await.raw_items())
-            .unwrap_or_default();
-        if !suffix.trim().is_empty() || request_tools.is_empty() {
+        let suffix = attempt_output.assistant_messages.join("\n");
+        if !attempt_output.called_tool && !suffix.trim().is_empty() {
             break suffix;
         }
 
-        // Advertising tools means the model may answer with a tool call instead of a summary.
-        // An empty summary would silently discard the entire thread, so fall back to the
-        // tool-free request that can only produce prose.
-        warn!("compaction produced no summary text with tools advertised; retrying without tools");
+        if request_tools.is_empty() {
+            return Err(CodexErr::Stream(
+                "compaction completed without usable summary text".into(),
+            ));
+        }
+
+        // Advertising tools preserves the local runtime's KV prefix, but the model may continue
+        // the task instead of summarizing it. Never treat an older assistant message or text
+        // accompanying a tool call as the handoff; retry tool-free so only fresh prose can win.
+        warn!(
+            called_tool = attempt_output.called_tool,
+            "compaction produced no usable summary with tools advertised; retrying without tools"
+        );
         request_tools = Arc::from(Vec::new());
         retries = 0;
     };
 
     let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.annotated_items();
-    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
+    let summary_text = match execution_cursor {
+        Some(cursor) => format!("{SUMMARY_PREFIX}\n{summary_suffix}\n\n{cursor}"),
+        None => format!("{SUMMARY_PREFIX}\n{summary_suffix}"),
+    };
     let user_messages = collect_annotated_user_messages(history_items);
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
@@ -756,6 +777,44 @@ fn build_compacted_history_with_limit(
     history
 }
 
+#[derive(Default)]
+struct CompactionAttemptOutput {
+    assistant_messages: Vec<String>,
+    called_tool: bool,
+}
+
+#[derive(Default)]
+struct CompactionProgressCounters {
+    output_bytes: u64,
+    output_chunks: u64,
+}
+
+impl CompactionProgressCounters {
+    fn record(&mut self, delta: &str) {
+        self.output_bytes = self
+            .output_bytes
+            .saturating_add(u64::try_from(delta.len()).unwrap_or(u64::MAX));
+        self.output_chunks = self.output_chunks.saturating_add(1);
+    }
+
+    fn event(
+        &self,
+        item_id: &str,
+        attempt: u32,
+        phase: ContextCompactionProgressPhase,
+        output_tokens: Option<i64>,
+    ) -> EventMsg {
+        EventMsg::ContextCompactionProgress(ContextCompactionProgressEvent {
+            item_id: item_id.to_string(),
+            phase,
+            attempt,
+            output_bytes: self.output_bytes,
+            output_chunks: self.output_chunks,
+            output_tokens,
+        })
+    }
+}
+
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
@@ -763,13 +822,16 @@ async fn drain_to_completed(
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
     progress_item_id: &str,
-) -> CodexResult<()> {
+    progress_attempt: u32,
+) -> CodexResult<CompactionAttemptOutput> {
+    let mut output = CompactionAttemptOutput::default();
+    let mut progress = CompactionProgressCounters::default();
     let mut stream = client_session
         .stream(
             prompt,
             &turn_context.model_info,
             &turn_context.session_telemetry,
-            turn_context.reasoning_effort.clone(),
+            turn_context.compact_reasoning_effort(),
             turn_context.reasoning_summary,
             turn_context.config.service_tier.clone(),
             responses_metadata,
@@ -787,6 +849,20 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
+                if let Some(message) =
+                    last_assistant_message_from_item(&item, /*plan_mode*/ false)
+                {
+                    output.assistant_messages.push(message);
+                }
+                output.called_tool |= matches!(
+                    item,
+                    ResponseItem::LocalShellCall { .. }
+                        | ResponseItem::FunctionCall { .. }
+                        | ResponseItem::ToolSearchCall { .. }
+                        | ResponseItem::CustomToolCall { .. }
+                        | ResponseItem::WebSearchCall { .. }
+                        | ResponseItem::ImageGenerationCall { .. }
+                );
                 sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
                     .await;
             }
@@ -796,23 +872,20 @@ async fn drain_to_completed(
             Ok(ResponseEvent::RateLimits(snapshot)) => {
                 sess.update_rate_limits(turn_context, snapshot).await;
             }
-            // Forward the summarization stream so the UI can show that compaction is making
-            // progress. Without this the whole compaction is silent: on a local model the
-            // summary can take minutes to generate, which is indistinguishable from a hang.
-            // Reasoning deltas matter as much as text here — a thinking model can spend its
-            // entire output budget reasoning before it emits a single character of summary.
+            // Count both visible and reasoning output. A thinking model can consume most of its
+            // compaction run before producing summary text, and the meter must reflect that work.
             Ok(ResponseEvent::OutputTextDelta(delta))
             | Ok(ResponseEvent::ReasoningContentDelta { delta, .. })
             | Ok(ResponseEvent::ReasoningSummaryDelta { delta, .. }) => {
+                progress.record(&delta);
                 sess.send_event(
                     turn_context,
-                    EventMsg::ReasoningContentDelta(ReasoningContentDeltaEvent {
-                        thread_id: sess.thread_id.to_string(),
-                        turn_id: turn_context.sub_id.clone(),
-                        item_id: progress_item_id.to_string(),
-                        delta,
-                        summary_index: 0,
-                    }),
+                    progress.event(
+                        progress_item_id,
+                        progress_attempt,
+                        ContextCompactionProgressPhase::Generating,
+                        None,
+                    ),
                 )
                 .await;
             }
@@ -823,6 +896,16 @@ async fn drain_to_completed(
             }) => {
                 sess.send_event(
                     turn_context,
+                    progress.event(
+                        progress_item_id,
+                        progress_attempt,
+                        ContextCompactionProgressPhase::Finalizing,
+                        token_usage.as_ref().map(|usage| usage.output_tokens),
+                    ),
+                )
+                .await;
+                sess.send_event(
+                    turn_context,
                     EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
                         response_id,
                         token_usage: token_usage.clone(),
@@ -831,7 +914,7 @@ async fn drain_to_completed(
                 .await;
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await?;
-                return Ok(());
+                return Ok(output);
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

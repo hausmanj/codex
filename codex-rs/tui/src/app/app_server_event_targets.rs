@@ -122,6 +122,9 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::McpToolCallProgress(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ContextCompactionProgress(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ReasoningSummaryTextDelta(notification) => {
             Some(notification.thread_id.as_str())
         }

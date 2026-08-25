@@ -1331,6 +1331,9 @@ pub enum EventMsg {
     /// Conversation history was compacted (either automatically or manually).
     ContextCompacted(ContextCompactedEvent),
 
+    /// Measured progress for an in-flight conversation compaction.
+    ContextCompactionProgress(ContextCompactionProgressEvent),
+
     /// Conversation history was rolled back by dropping the last N user turns.
     ThreadRolledBack(ThreadRolledBackEvent),
 
@@ -2004,6 +2007,28 @@ pub struct SafetyBufferingEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ContextCompactionProgressPhase {
+    Generating,
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ContextCompactionProgressEvent {
+    pub item_id: String,
+    pub phase: ContextCompactionProgressPhase,
+    #[ts(type = "number")]
+    pub attempt: u32,
+    #[ts(type = "number")]
+    pub output_bytes: u64,
+    #[ts(type = "number")]
+    pub output_chunks: u64,
+    #[ts(type = "number | null")]
+    pub output_tokens: Option<i64>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {

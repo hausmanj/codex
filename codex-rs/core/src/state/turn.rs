@@ -100,6 +100,19 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    explicit_task_completion: Option<ExplicitTaskCompletion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExplicitTaskCompletion {
+    pub(crate) status: ExplicitTaskCompletionStatus,
+    pub(crate) final_message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExplicitTaskCompletionStatus {
+    Completed,
+    Blocked,
 }
 
 pub(crate) struct PendingRequestPermissions {
@@ -109,6 +122,21 @@ pub(crate) struct PendingRequestPermissions {
 }
 
 impl TurnState {
+    pub(crate) fn record_explicit_task_completion(
+        &mut self,
+        status: ExplicitTaskCompletionStatus,
+        final_message: String,
+    ) {
+        self.explicit_task_completion = Some(ExplicitTaskCompletion {
+            status,
+            final_message,
+        });
+    }
+
+    pub(crate) fn explicit_task_completion(&self) -> Option<&ExplicitTaskCompletion> {
+        self.explicit_task_completion.as_ref()
+    }
+
     pub(crate) fn insert_pending_approval(
         &mut self,
         key: String,

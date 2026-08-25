@@ -205,17 +205,22 @@ mod agent_message_consolidation;
 mod agent_navigation;
 mod agent_picker;
 mod agent_status_feed;
+mod agents_overview;
+mod agents_overview_view;
 mod app_server_event_targets;
 mod app_server_events;
 pub(crate) mod app_server_requests;
 mod background_requests;
 mod config_persistence;
+mod connector_mentions;
 mod event_dispatch;
+mod file_change_approvals;
 mod history_pagination;
 mod history_ui;
 mod input;
 mod loaded_threads;
 mod pending_interactive_replay;
+mod permission_shortcuts;
 mod pets;
 mod platform_actions;
 mod plugin_mentions;
@@ -225,15 +230,21 @@ mod safety_buffering;
 mod session_lifecycle;
 mod side;
 mod startup_prompts;
+mod thread_event_buffer;
 mod thread_events;
 mod thread_goal_actions;
 mod thread_routing;
 mod thread_session_state;
 mod thread_settings;
+mod transcript_export;
+mod working_directory;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
+use self::agents_overview::AgentsOverviewState;
 use self::app_server_requests::PendingAppServerRequests;
+use self::history_ui::RenderedHistoryTail;
+use self::history_ui::ThreadUsageStatusHistory;
 use self::loaded_threads::find_loaded_subagent_threads_for_primary;
 use self::pending_interactive_replay::PendingInteractiveReplayState;
 use self::platform_actions::*;
@@ -242,6 +253,7 @@ use self::side::SideParentStatusChange;
 use self::side::SideThreadState;
 use self::startup_prompts::*;
 use self::thread_events::*;
+pub(crate) use agents_overview::AGENTS_OVERVIEW_VIEW_ID;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -518,6 +530,7 @@ pub(crate) struct App {
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
     launch_cwd: PathBuf,
+    pub(crate) runtime_working_directory_override: Option<PathBuf>,
     pub(crate) state_db: Option<StateDbHandle>,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
@@ -529,6 +542,9 @@ pub(crate) struct App {
     pub(crate) file_search: FileSearchManager,
 
     pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+    pub(crate) last_rendered_history_tail: Option<RenderedHistoryTail>,
+    pub(crate) last_thread_usage_status_cell: Option<ThreadUsageStatusHistory>,
+    pub(crate) pending_thread_usage_history_refresh: bool,
 
     // Pager overlay state (Transcript or Static like Diff)
     pub(crate) overlay: Option<Overlay>,
@@ -580,6 +596,7 @@ pub(crate) struct App {
     thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
     thread_event_listener_tasks: HashMap<ThreadId, JoinHandle<()>>,
     agent_navigation: AgentNavigationState,
+    pub(crate) agents_overview: AgentsOverviewState,
     side_threads: HashMap<ThreadId, SideThreadState>,
     abandoned_side_threads: HashSet<ThreadId>,
     active_thread_id: Option<ThreadId>,
@@ -590,6 +607,8 @@ pub(crate) struct App {
     pending_primary_events: VecDeque<ThreadBufferedEvent>,
     pending_app_server_requests: PendingAppServerRequests,
     pending_startup_thread_start: bool,
+    pub(crate) startup_protected_input_boundary: bool,
+    pub(crate) startup_pending_protected_request: bool,
     /// Invalidates in-flight full rate-limit reads when a newer rolling hard stop arrives.
     rate_limit_hard_stop_generation: u64,
     // Serialize plugin enablement writes per plugin so stale completions cannot
@@ -836,7 +855,7 @@ impl App {
             &available_models,
         )
         .await;
-        if let Some(exit_info) = exit_info {
+        if let Ok(Some(exit_info)) = exit_info {
             app_server
                 .shutdown()
                 .await
@@ -902,13 +921,22 @@ impl App {
             &session_selection,
             SessionSelection::StartFresh | SessionSelection::Exit
         );
+        let start_in_agents_overview =
+            matches!(&session_selection, SessionSelection::AgentsOverview);
         let (mut chat_widget, initial_started_thread) = match session_selection {
-            SessionSelection::StartFresh | SessionSelection::Exit => {
-                spawn_startup_thread_start(&app_server, config.clone(), app_event_tx.clone());
+            SessionSelection::StartFresh
+            | SessionSelection::Exit
+            | SessionSelection::AgentsOverview => {
+                if !start_in_agents_overview {
+                    spawn_startup_thread_start(&app_server, config.clone(), app_event_tx.clone());
+                }
                 // Count a startup tooltip once the initial chat widget can render it.
-                let startup_tooltip_override =
+                let startup_tooltip_override = if start_in_agents_overview {
+                    None
+                } else {
                     prepare_startup_tooltip_override(&mut config, &available_models, is_first_run)
-                        .await;
+                        .await
+                };
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -1042,6 +1070,7 @@ See the Codex keymap documentation for supported actions and examples."
             workspace_command_runner: Some(workspace_command_runner),
             config,
             launch_cwd,
+            runtime_working_directory_override: None,
             state_db,
             cli_kv_overrides,
             harness_overrides,
@@ -1054,6 +1083,9 @@ See the Codex keymap documentation for supported actions and examples."
             keymap: runtime_keymap,
             key_chord_matcher: KeyChordMatcher::default(),
             transcript_cells: Vec::new(),
+            last_rendered_history_tail: None,
+            last_thread_usage_status_cell: None,
+            pending_thread_usage_history_refresh: false,
             overlay: None,
             deferred_history_lines: Vec::new(),
             has_emitted_history_lines: false,
@@ -1076,6 +1108,7 @@ See the Codex keymap documentation for supported actions and examples."
             thread_event_channels: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
+            agents_overview: Default::default(),
             side_threads: HashMap::new(),
             abandoned_side_threads: HashSet::new(),
             active_thread_id: None,
@@ -1086,6 +1119,8 @@ See the Codex keymap documentation for supported actions and examples."
             pending_primary_events: VecDeque::new(),
             pending_app_server_requests: PendingAppServerRequests::default(),
             pending_startup_thread_start,
+            startup_protected_input_boundary: true,
+            startup_pending_protected_request: false,
             rate_limit_hard_stop_generation: 0,
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),

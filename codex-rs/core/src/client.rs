@@ -317,6 +317,7 @@ fn responses_request_properties_match(
         tools: previous_tools,
         tool_choice: previous_tool_choice,
         parallel_tool_calls: previous_parallel_tool_calls,
+        max_output_tokens: previous_max_output_tokens,
         reasoning: previous_reasoning,
         store: previous_store,
         stream: previous_stream,
@@ -334,6 +335,7 @@ fn responses_request_properties_match(
         tools: current_tools,
         tool_choice: current_tool_choice,
         parallel_tool_calls: current_parallel_tool_calls,
+        max_output_tokens: current_max_output_tokens,
         reasoning: current_reasoning,
         store: current_store,
         stream: current_stream,
@@ -350,6 +352,7 @@ fn responses_request_properties_match(
         && previous_tools == current_tools
         && previous_tool_choice == current_tool_choice
         && previous_parallel_tool_calls == current_parallel_tool_calls
+        && previous_max_output_tokens == current_max_output_tokens
         && previous_reasoning == current_reasoning
         && previous_store == current_store
         && previous_stream == current_stream
@@ -950,6 +953,7 @@ impl ModelClient {
             tools,
             tool_choice: "auto".to_string(),
             parallel_tool_calls: prompt.parallel_tool_calls && !model_info.use_responses_lite,
+            max_output_tokens: prompt.max_output_tokens,
             reasoning: Some(reasoning),
             store: false,
             stream: true,

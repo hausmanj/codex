@@ -49,18 +49,6 @@ impl PlanProgress {
         self.seen = true;
     }
 
-    /// Treat an explicit phase handoff as one unfinished implicit step when
-    /// the model did not use the plan tool. The normal continue cap still
-    /// bounds retries for models that repeatedly narrate instead of acting.
-    pub fn record_implicit_transition(&mut self) {
-        if !self.seen {
-            self.total = 1;
-            self.completed = 0;
-            self.idle_continues = 0;
-            self.seen = true;
-        }
-    }
-
     /// Whether the recorded plan still has unfinished steps.
     pub fn has_unfinished_work(&self) -> bool {
         self.seen && self.total > 0 && self.completed < self.total
@@ -101,20 +89,6 @@ pub fn plan_continue_message(remaining: usize) -> String {
          genuinely done or you are blocked on something only a human can resolve \
          (in which case say plainly what you need)."
     )
-}
-
-/// A colon-terminated transition is the smallest reliable signal that a
-/// model announced the next phase but stopped before doing it. Require a
-/// transition word as well so ordinary prose ending in a colon is unaffected.
-pub fn looks_like_implicit_transition(message: &str) -> bool {
-    let trimmed = message.trim();
-    if !trimmed.ends_with(':') {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    ["now ", "next ", "then ", "moving on", "proceeding ", "continue "]
-        .iter()
-        .any(|marker| lower.contains(marker))
 }
 
 #[cfg(test)]
@@ -202,24 +176,6 @@ mod tests {
         let mut p = PlanProgress::default();
         p.record(&plan(&[StepStatus::InProgress]));
         assert!(p.has_unfinished_work());
-    }
-
-    #[test]
-    fn implicit_transition_creates_bounded_unfinished_work() {
-        let mut p = PlanProgress::default();
-        p.record_implicit_transition();
-        assert!(p.has_unfinished_work());
-        assert!(p.take_continue(1));
-        assert!(!p.take_continue(1));
-    }
-
-    #[test]
-    fn transition_language_requires_colon() {
-        assert!(looks_like_implicit_transition(
-            "Icon + gitignore done. Now the RoamiCore sources:"
-        ));
-        assert!(!looks_like_implicit_transition("Now the RoamiCore sources."));
-        assert!(!looks_like_implicit_transition("The result is complete:"));
     }
 
     #[test]

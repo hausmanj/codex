@@ -331,6 +331,19 @@ impl TurnContext {
             .or_else(|| self.model_info.default_reasoning_level.clone())
     }
 
+    /// Reasoning effort to use for compaction requests (local or remote).
+    ///
+    /// Compaction is a summarization task, not normal coding work, so it can
+    /// run at a cheaper reasoning effort without affecting normal-turn
+    /// behavior. Prefers `config.compact_model_reasoning_effort`; falls back
+    /// to the turn's normal `reasoning_effort` when unset.
+    pub(crate) fn compact_reasoning_effort(&self) -> Option<ReasoningEffortConfig> {
+        self.config
+            .compact_model_reasoning_effort
+            .clone()
+            .or_else(|| self.reasoning_effort.clone())
+    }
+
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
         self.effective_reasoning_effort()
             .map(|effort| effort.to_string())

@@ -14,6 +14,7 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::ExplicitTaskCompletionHandler;
 use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
@@ -1014,6 +1015,10 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
 
     if turn_context.config.update_plan_enabled {
         registry.add(PlanHandler);
+    }
+
+    if features.enabled(Feature::ExplicitTaskCompletion) {
+        registry.add_with_exposure(ExplicitTaskCompletionHandler, ToolExposure::DirectModelOnly);
     }
 
     if features.enabled(Feature::DeferredExecutor) {

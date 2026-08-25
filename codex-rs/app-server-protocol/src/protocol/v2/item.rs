@@ -1378,6 +1378,47 @@ pub struct ReasoningSummaryTextDeltaNotification {
     pub summary_index: i64,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ContextCompactionProgressNotification {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub phase: ContextCompactionProgressPhase,
+    #[ts(type = "number")]
+    pub attempt: u32,
+    #[ts(type = "number")]
+    pub output_bytes: u64,
+    #[ts(type = "number")]
+    pub output_chunks: u64,
+    #[ts(type = "number | null")]
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export_to = "v2/", rename_all = "snake_case")]
+pub enum ContextCompactionProgressPhase {
+    Generating,
+    Finalizing,
+}
+
+impl From<codex_protocol::protocol::ContextCompactionProgressPhase>
+    for ContextCompactionProgressPhase
+{
+    fn from(value: codex_protocol::protocol::ContextCompactionProgressPhase) -> Self {
+        match value {
+            codex_protocol::protocol::ContextCompactionProgressPhase::Generating => {
+                Self::Generating
+            }
+            codex_protocol::protocol::ContextCompactionProgressPhase::Finalizing => {
+                Self::Finalizing
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

@@ -947,6 +947,7 @@ mod tests {
             ),
             tool_choice: "auto".to_string(),
             parallel_tool_calls: true,
+            max_output_tokens: None,
             reasoning: None,
             store: false,
             stream: true,

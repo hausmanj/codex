@@ -1606,8 +1606,7 @@ async fn context_compaction_started_announces_progress() {
         /*replay_kind*/ None,
     );
 
-    // Compaction streams no deltas; without this announcement the UI is silent for as long as
-    // the summarization takes, which reads as a hang.
+    // Compaction can spend a long time in provider prefill before progress telemetry exists.
     let rendered = drain_insert_history(&mut rx)
         .into_iter()
         .map(|lines| lines_to_single_string(&lines))
@@ -1624,32 +1623,28 @@ async fn context_compaction_started_announces_progress() {
         .expect("status indicator should be visible");
     assert_eq!(status.header(), "Compacting context");
 
-    // Compaction reuses the reasoning-delta channel to report progress. It must drive the status
-    // line rather than the transcript, so a long summarization visibly advances.
-    for delta in ["Reviewing the auth", " refactor and the"] {
-        chat.handle_server_notification(
-            ServerNotification::ReasoningSummaryTextDelta(
-                codex_app_server_protocol::ReasoningSummaryTextDeltaNotification {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item_id: "compaction-1".to_string(),
-                    delta: delta.to_string(),
-                    summary_index: 0,
-                },
-            ),
-            /*replay_kind*/ None,
-        );
-    }
+    chat.handle_server_notification(
+        ServerNotification::ContextCompactionProgress(
+            codex_app_server_protocol::ContextCompactionProgressNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "compaction-1".to_string(),
+                phase: codex_app_server_protocol::ContextCompactionProgressPhase::Generating,
+                attempt: 1,
+                output_bytes: 5632,
+                output_chunks: 17,
+                output_tokens: None,
+            },
+        ),
+        /*replay_kind*/ None,
+    );
 
     let status = chat
         .bottom_pane
         .status_widget()
         .expect("status indicator should be visible");
     let details = status.details().unwrap_or_default();
-    assert!(
-        details.contains("tokens") && details.contains("refactor"),
-        "status should show streamed compaction progress, got: {details}"
-    );
+    assert_chatwidget_snapshot!("compaction_progress_meter", details);
     assert!(
         drain_insert_history(&mut rx).is_empty(),
         "compaction progress must not be written to the transcript"

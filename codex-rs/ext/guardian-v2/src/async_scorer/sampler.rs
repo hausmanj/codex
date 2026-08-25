@@ -390,6 +390,7 @@ impl LunaSampler {
             | LunaSamplerError::Api(
                 ApiError::Transport(TransportError::Build(_))
                 | ApiError::ContextWindowExceeded
+                | ApiError::OutputTokenLimitExceeded { .. }
                 | ApiError::QuotaExceeded
                 | ApiError::UsageNotIncluded
                 | ApiError::RateLimit(_)
@@ -480,6 +481,7 @@ impl LunaSampler {
             tools: None,
             tool_choice: "none".to_owned(),
             parallel_tool_calls: false,
+            max_output_tokens: None,
             reasoning: Some(Reasoning {
                 effort: Some(request.reasoning_effort),
                 summary: None,

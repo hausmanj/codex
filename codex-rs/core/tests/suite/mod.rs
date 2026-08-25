@@ -65,6 +65,7 @@ mod deprecation_notice;
 mod empty_completion_retry;
 mod exec;
 mod exec_policy;
+mod explicit_task_completion;
 #[cfg(not(target_os = "windows"))]
 mod extension_sandbox;
 mod external_auth;

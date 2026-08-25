@@ -78,6 +78,10 @@ pub struct RepeatCallGuard {
     /// tracking at all, since it fires when the model never even reached a
     /// tool call. See `take_stall_for_auto_nudge`.
     no_progress_stall: bool,
+    /// Set when the provider stops a response at the configured output-token budget before it
+    /// completes an item. Kept distinct so the follow-up explains the actual boundary instead of
+    /// describing a transport failure or timeout.
+    output_token_limit_stall: bool,
     /// Consecutive auto-nudges issued for this unresolved stall streak. Reset
     /// to 0 on genuine progress (`note_state_change`), never by a mere retry.
     /// Shared across both stall kinds -- either one counts toward the same
@@ -98,6 +102,8 @@ pub enum StallKind {
     /// The turn was cut for producing no completed item within the
     /// configured no-progress timeout.
     NoProgress,
+    /// The provider ended the response at the configured output-token budget.
+    OutputTokenLimit,
 }
 
 impl Default for RepeatCallGuard {
@@ -114,6 +120,7 @@ impl RepeatCallGuard {
             threshold: block_after_repeats.max(2),
             blocked_without_followup: false,
             no_progress_stall: false,
+            output_token_limit_stall: false,
             consecutive_nudges: 0,
         }
     }
@@ -126,6 +133,10 @@ impl RepeatCallGuard {
         self.no_progress_stall = true;
     }
 
+    pub fn mark_output_token_limit_stall(&mut self) {
+        self.output_token_limit_stall = true;
+    }
+
     /// Non-consuming peek at whether a no-progress stall is pending, without
     /// touching the repeated-tool-call stall flag. Used only to let
     /// `on_task_finished` auto-nudge even when the watchdog's own abort left
@@ -134,8 +145,8 @@ impl RepeatCallGuard {
     /// cannot let a repeat-guard block ride along and auto-nudge after a
     /// genuine user interrupt, which is exactly the case the `Completed`-only
     /// gate exists to prevent for that stall kind.
-    pub fn has_no_progress_stall_pending(&self) -> bool {
-        self.no_progress_stall
+    pub fn has_generation_stall_pending(&self) -> bool {
+        self.no_progress_stall || self.output_token_limit_stall
     }
 
     /// Returns the model-facing block message when this invocation must not be
@@ -171,6 +182,7 @@ impl RepeatCallGuard {
         // else happened before the turn ended" counts as a stall.
         self.blocked_without_followup = false;
         self.no_progress_stall = false;
+        self.output_token_limit_stall = false;
         let repeat = match self.entries.get(signature) {
             Some(entry) if entry.last_result_hash == result_hash => {
                 entry.repeat_of_last_result.saturating_add(1)
@@ -208,6 +220,7 @@ impl RepeatCallGuard {
         self.insertion_order.clear();
         self.blocked_without_followup = false;
         self.no_progress_stall = false;
+        self.output_token_limit_stall = false;
         self.consecutive_nudges = 0;
     }
 
@@ -224,8 +237,11 @@ impl RepeatCallGuard {
     pub fn take_stall_for_auto_nudge(&mut self, max: u32) -> Option<StallKind> {
         let blocked = std::mem::take(&mut self.blocked_without_followup);
         let no_progress = std::mem::take(&mut self.no_progress_stall);
+        let output_token_limit = std::mem::take(&mut self.output_token_limit_stall);
         let kind = if blocked {
             Some(StallKind::RepeatedToolCall)
+        } else if output_token_limit {
+            Some(StallKind::OutputTokenLimit)
         } else if no_progress {
             Some(StallKind::NoProgress)
         } else {
@@ -440,6 +456,13 @@ pub fn auto_nudge_message(kind: StallKind) -> String {
              state what you are trying to accomplish right now based on the conversation \
              so far, then take ONE concrete, small step toward it — a single tool call or \
              a short direct answer, not another long uninterrupted stretch of reasoning."
+                .to_string()
+        }
+        StallKind::OutputTokenLimit => {
+            "Your previous response reached the configured output-token budget without completing \
+             its next action. Do not regenerate the same long reasoning or payload unchanged. \
+             Continue from the latest completed conversation event and take ONE concrete, bounded \
+             next step now. Split large writes or investigations across multiple tool calls."
                 .to_string()
         }
     }
@@ -707,6 +730,17 @@ mod tests {
         assert_eq!(guard.take_stall_for_auto_nudge(3), None);
     }
 
+    #[test]
+    fn output_token_limit_stall_reports_its_own_kind() {
+        let mut guard = RepeatCallGuard::new(2);
+        guard.mark_output_token_limit_stall();
+        assert_eq!(
+            guard.take_stall_for_auto_nudge(3),
+            Some(StallKind::OutputTokenLimit)
+        );
+        assert_eq!(guard.take_stall_for_auto_nudge(3), None);
+    }
+
     /// A repeated-tool-call block takes priority if (implausibly) both stall
     /// flags are set at once, since it carries more specific information.
     #[test]
@@ -728,218 +762,8 @@ mod tests {
 /// `2>&1` is deliberately absent — it redirects a stream to another stream and
 /// touches nothing.
 fn script_writes_output(script: &str) -> bool {
-    let mut chars = script.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        if ch != '>' {
-            continue;
-        }
-        // `2>&1`, `>&2` and friends rewire descriptors without writing a file.
-        let redirects_to_descriptor =
-            script[idx + 1..].starts_with('&') || script[idx + 1..].starts_with(">&");
-        if !redirects_to_descriptor {
-            return true;
-        }
-    }
-    // `tee` writes files even without a redirection operator.
-    script
-        .split(|c: char| c.is_whitespace() || c == '|' || c == ';' || c == '&')
-        .any(|token| token == "tee")
-}
-
-/// Programs that change state on success. Read-only tools an agent commonly
-/// loops on (curl, ping, nc, git status/log/diff, docker ps, python -c ...) are
-/// intentionally absent so their repeats accumulate.
-fn invokes_mutating_program(cmd: &str) -> bool {
-    const MUTATING: &[&str] = &[
-        "rm", "rmdir", "mv", "cp", "mkdir", "touch", "chmod", "chown", "ln", "truncate", "dd",
-        "install", "patch", "tee", "make", "cmake", "ninja",
-    ];
-    // Subcommand-sensitive tools: only some verbs mutate.
-    const MUTATING_SUBCOMMANDS: &[(&str, &[&str])] = &[
-        (
-            "git",
-            &[
-                "commit",
-                "add",
-                "rm",
-                "mv",
-                "checkout",
-                "switch",
-                "restore",
-                "reset",
-                "merge",
-                "rebase",
-                "cherry-pick",
-                "revert",
-                "push",
-                "pull",
-                "fetch",
-                "clone",
-                "apply",
-                "stash",
-                "clean",
-                "tag",
-                "branch",
-                "init",
-            ],
-        ),
-        (
-            "npm",
-            &[
-                "install",
-                "i",
-                "ci",
-                "uninstall",
-                "update",
-                "run",
-                "publish",
-            ],
-        ),
-        ("pnpm", &["install", "i", "add", "remove", "update", "run"]),
-        ("yarn", &["install", "add", "remove", "upgrade", "run"]),
-        ("pip", &["install", "uninstall"]),
-        ("pip3", &["install", "uninstall"]),
-        ("uv", &["pip", "add", "remove", "sync", "install"]),
-        (
-            "cargo",
-            &["add", "remove", "install", "publish", "fix", "clean"],
-        ),
-        (
-            "brew",
-            &["install", "uninstall", "upgrade", "link", "unlink"],
-        ),
-        (
-            "docker",
-            &[
-                "run", "rm", "rmi", "build", "start", "stop", "restart", "compose",
-            ],
-        ),
-        ("kubectl", &["apply", "delete", "create", "patch", "scale"]),
-        (
-            "systemctl",
-            &["start", "stop", "restart", "enable", "disable"],
-        ),
-    ];
-
-    let mut tokens = cmd
-        .split_whitespace()
-        .skip_while(|token| token.contains('=') || matches!(*token, "sudo" | "env" | "command"));
-    let Some(program) = tokens.next() else {
-        return false;
-    };
-    let program = program.rsplit('/').next().unwrap_or(program);
-
-    if MUTATING.contains(&program) {
-        return true;
-    }
-    // `sed -i` edits in place; plain `sed` is a filter.
-    if program == "sed" {
-        return cmd
-            .split_whitespace()
-            .any(|t| t == "-i" || t.starts_with("-i."));
-    }
-    if let Some((_, verbs)) = MUTATING_SUBCOMMANDS
-        .iter()
-        .find(|(name, _)| *name == program)
-    {
-        let subcommand = tokens.find(|token| !token.starts_with('-'));
-        return subcommand.is_some_and(|verb| verbs.contains(&verb));
-    }
-    false
-}
-
-#[cfg(test)]
-mod mutation_classification_tests {
-    use super::*;
-    use pretty_assertions::assert_eq;
-
-    /// The exact command that looped in a live session. It is read-only, so it
-    /// must not count as a state change; otherwise every call clears the history
-    /// and the guard can never reach its threshold.
-    #[test]
-    fn looping_curl_pipeline_is_not_a_state_change() {
-        let script = "cd ~/source/immich && timeout 8 curl -s \
-            http://127.0.0.1:2285/api/server-info/ping -H 'Accept: text/html' -v 2>&1 \
-            | grep -E '^< (HTTP|Content)'";
-        assert!(!RepeatCallGuard::is_mutating_shell_script(script));
-    }
-
-    #[test]
-    fn read_only_probes_are_not_state_changes() {
-        for script in [
-            "ping -c 3 192.168.0.253",
-            "nc -z -w 4 192.168.0.253 2285",
-            "git status -sb",
-            "git log --oneline -15",
-            "git diff --stat",
-            "docker ps --filter name=mobile-test",
-            "cat README.md",
-            "ls -la /tmp",
-            "python3 -c 'print(1)'",
-            "curl -s http://localhost:8080 2>&1 | head -c 300",
-        ] {
-            assert!(
-                !RepeatCallGuard::is_mutating_shell_script(script),
-                "should not be mutating: {script}"
-            );
-        }
-    }
-
-    #[test]
-    fn genuine_mutations_are_state_changes() {
-        for script in [
-            "rm -rf build",
-            "mkdir -p out",
-            "mv a b",
-            "echo hi > file.txt",
-            "echo hi >> file.txt",
-            "cat x | tee out.txt",
-            "git commit -m 'x'",
-            "git checkout main",
-            "npm install",
-            "pip install requests",
-            "docker run --rm alpine",
-            "sed -i 's/a/b/' file.txt",
-            "make",
-        ] {
-            assert!(
-                RepeatCallGuard::is_mutating_shell_script(script),
-                "should be mutating: {script}"
-            );
-        }
-    }
-
-    /// `2>&1` rewires a descriptor; it writes nothing.
-    #[test]
-    fn stream_redirection_is_not_a_write() {
-        assert!(!script_writes_output("curl -v http://x 2>&1 | grep a"));
-        assert!(!script_writes_output("cmd >&2"));
-        assert!(script_writes_output("cmd > out.txt"));
-    }
-
-    /// End-to-end: three identical read-only calls, then the fourth is blocked.
-    #[test]
-    fn repeated_read_only_call_now_reaches_the_threshold() {
-        let mut guard = RepeatCallGuard::new(3);
-        let signature = "shell_command|curl -s http://x|/tmp||remote=false|approval=never|mode=default|win_sandbox=none";
-        let hash = "same-result".to_string();
-        for _ in 0..3 {
-            assert_eq!(guard.check(signature).is_none(), true);
-            guard.record(signature, hash.clone());
-        }
-        assert!(
-            guard.check(signature).is_some(),
-            "fourth identical call must be blocked"
-        );
-    }
-}
-
-/// Shell tokens that write somewhere: redirections and in-place stream writers.
-/// `2>&1` is deliberately absent — it redirects a stream to another stream and
-/// touches nothing.
-fn script_writes_output(script: &str) -> bool {
-    let mut chars = script.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
+    let chars = script.char_indices().peekable();
+    for (idx, ch) in chars {
         if ch != '>' {
             continue;
         }

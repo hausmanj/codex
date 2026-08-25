@@ -36,6 +36,8 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ContextCompactionProgressEvent;
+use codex_protocol::protocol::ContextCompactionProgressPhase;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
@@ -221,8 +223,8 @@ async fn run_remote_compact_task_inner_impl(
         analytics_details,
     )
     .await;
-    let (attempt, compaction_turn_context) = match attempt {
-        Ok(attempt) => (attempt, turn_context),
+    let (attempt, compaction_turn_context, progress_attempt) = match attempt {
+        Ok(attempt) => (attempt, turn_context, 1),
         Err(error) => {
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
@@ -256,7 +258,7 @@ async fn run_remote_compact_task_inner_impl(
                 fallback_result.as_ref().err(),
             );
             match fallback_result {
-                Ok(attempt) => (attempt, fallback_turn_context),
+                Ok(attempt) => (attempt, fallback_turn_context, 2),
                 Err(_) => return Err(error),
             }
         }
@@ -265,6 +267,18 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
+    sess.send_event(
+        compaction_turn_context,
+        EventMsg::ContextCompactionProgress(ContextCompactionProgressEvent {
+            item_id: compaction_id,
+            phase: ContextCompactionProgressPhase::Finalizing,
+            attempt: progress_attempt,
+            output_bytes: 0,
+            output_chunks: 0,
+            output_tokens: None,
+        }),
+    )
+    .await;
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (new_history, world_state_baseline) =
         process_compacted_history(sess.as_ref(), new_history, &initial_context_injection).await;

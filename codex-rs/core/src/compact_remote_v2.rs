@@ -44,6 +44,8 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ContextCompactionProgressEvent;
+use codex_protocol::protocol::ContextCompactionProgressPhase;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
@@ -239,8 +241,8 @@ async fn run_remote_compact_task_inner_impl(
         analytics_details,
     )
     .await;
-    let (attempt, compaction_turn_context) = match attempt {
-        Ok(attempt) => (attempt, turn_context),
+    let (attempt, compaction_turn_context, progress_attempt) = match attempt {
+        Ok(attempt) => (attempt, turn_context, 1),
         Err(error) => {
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
@@ -274,7 +276,7 @@ async fn run_remote_compact_task_inner_impl(
                 fallback_result.as_ref().err(),
             );
             match fallback_result {
-                Ok(attempt) => (attempt, fallback_turn_context),
+                Ok(attempt) => (attempt, fallback_turn_context, 2),
                 Err(_) => return Err(error),
             }
         }
@@ -287,6 +289,18 @@ async fn run_remote_compact_task_inner_impl(
         token_usage,
         owned_client_session: _owned_client_session,
     } = attempt;
+    sess.send_event(
+        compaction_turn_context,
+        EventMsg::ContextCompactionProgress(ContextCompactionProgressEvent {
+            item_id: compaction_id,
+            phase: ContextCompactionProgressPhase::Finalizing,
+            attempt: progress_attempt,
+            output_bytes: 0,
+            output_chunks: 0,
+            output_tokens: token_usage.as_ref().map(|usage| usage.output_tokens),
+        }),
+    )
+    .await;
     if let Some(token_usage) = token_usage {
         sess.record_rollout_budget_usage(&token_usage)?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
@@ -366,7 +380,7 @@ async fn run_remote_compaction_request_v2(
                 prompt,
                 &turn_context.model_info,
                 &turn_context.session_telemetry,
-                turn_context.reasoning_effort.clone(),
+                turn_context.compact_reasoning_effort(),
                 turn_context.reasoning_summary,
                 turn_context.config.service_tier.clone(),
                 responses_metadata,

@@ -900,9 +900,6 @@ impl Session {
         } else {
             ThreadIdleCause::Completed
         };
-        let implicit_transition = crate::tools::plan_progress::looks_like_implicit_transition(
-            last_agent_message.as_deref().unwrap_or_default(),
-        );
         let event = if let Some(reason) = abort_reason {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -974,14 +971,14 @@ impl Session {
             // repeat-guard block ride along and auto-nudge right after a
             // real user interrupt, which is the failure mode this rule
             // exists to prevent.
-            let no_progress_stall_pending = self
+            let generation_stall_pending = self
                 .services
                 .repeat_call_guard
                 .lock()
                 .await
-                .has_no_progress_stall_pending();
+                .has_generation_stall_pending();
             let auto_nudge_max = (matches!(idle_cause, ThreadIdleCause::Completed)
-                || no_progress_stall_pending)
+                || generation_stall_pending)
                 .then(|| {
                     turn_context
                         .config
@@ -1006,7 +1003,7 @@ impl Session {
             // an intentional preemption) took control and must not be followed
             // by an unsolicited turn.
             let should_continue_plan = matches!(idle_cause, ThreadIdleCause::Completed)
-                || (matches!(idle_cause, ThreadIdleCause::Failed) && !no_progress_stall_pending);
+                || (matches!(idle_cause, ThreadIdleCause::Failed) && !generation_stall_pending);
             if should_continue_plan
                 && let Some(max_idle) = turn_context
                     .config
@@ -1014,10 +1011,6 @@ impl Session {
                     .as_ref()
                     .map(|c| c.plan_continue_max_idle)
             {
-                if implicit_transition {
-                    let mut plan = self.services.plan_progress.lock().await;
-                    plan.record_implicit_transition();
-                }
                 self.maybe_start_plan_continue_turn(max_idle).await;
             }
         }

@@ -292,6 +292,8 @@ pub enum Feature {
     CurrentTimeReminder,
     /// Block tool calls that repeat an unchanged command with an identical result.
     RepeatGuard,
+    /// Require every turn to declare a structured terminal disposition.
+    ExplicitTaskCompletion,
     /// Cut an in-flight generation short as soon as the user types, instead of
     /// waiting for the response and its tool calls to finish.
     PreemptOnUserInput,
@@ -1459,6 +1461,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "repeat_guard",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::ExplicitTaskCompletion,
+        key: "explicit_task_completion",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::PreemptOnUserInput,

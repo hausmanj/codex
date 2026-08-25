@@ -184,6 +184,7 @@ mod status_indicator_widget;
 mod streaming;
 mod style;
 mod terminal_hyperlinks;
+mod terminal_lifecycle;
 mod terminal_palette;
 mod terminal_probe;
 mod terminal_title;
@@ -1715,7 +1716,6 @@ async fn run_ratatui_app(
         startup_elapsed_before_app,
         startup_bootstrap,
         startup_hooks_browser,
-        startup_draft,
     )
     .await;
 
