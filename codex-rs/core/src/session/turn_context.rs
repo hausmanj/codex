@@ -344,6 +344,20 @@ impl TurnContext {
             .or_else(|| self.reasoning_effort.clone())
     }
 
+    /// Output-token budget for compaction requests (local or remote).
+    ///
+    /// A compaction emits a summary, so it does not need a normal turn's output
+    /// budget. On a slow local runtime this budget, not prefill, dominates how
+    /// long a compaction takes: an 8000-token budget at a measured 10-13 tok/s
+    /// is 10+ minutes of generation. Prefers
+    /// `config.compact_model_max_output_tokens`; falls back to
+    /// `model_max_output_tokens` when unset.
+    pub(crate) fn compact_max_output_tokens(&self) -> Option<u64> {
+        self.config
+            .compact_model_max_output_tokens
+            .or(self.config.model_max_output_tokens)
+    }
+
     pub(crate) fn effective_reasoning_effort_for_tracing(&self) -> String {
         self.effective_reasoning_effort()
             .map(|effort| effort.to_string())

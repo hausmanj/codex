@@ -312,7 +312,7 @@ async fn run_compact_task_inner_impl(
                 tools: Arc::clone(&request_tools),
                 // Match the sampling request's value so the request bodies stay comparable.
                 parallel_tool_calls: !request_tools.is_empty(),
-                max_output_tokens: turn_context.config.model_max_output_tokens,
+                max_output_tokens: turn_context.compact_max_output_tokens(),
                 base_instructions: sess.get_base_instructions().await,
                 ..Default::default()
             };

@@ -64,7 +64,7 @@ pub(super) async fn run_remote_compact_attempt(
         input: prompt_input,
         tools: tool_router.model_visible_specs(),
         parallel_tool_calls: true,
-        max_output_tokens: turn_context.config.model_max_output_tokens,
+        max_output_tokens: turn_context.compact_max_output_tokens(),
         base_instructions,
         output_schema: None,
         output_schema_strict: true,
