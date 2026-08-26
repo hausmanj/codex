@@ -148,6 +148,7 @@ mod markdown;
 mod markdown_render;
 mod markdown_stream;
 mod markdown_text_merge;
+mod mem_watchdog;
 mod mention_codec;
 mod model_catalog;
 mod model_migration;
@@ -987,6 +988,16 @@ async fn run_ratatui_app(
         tracing::error!("panic: {info}");
         prev_hook(info);
     }));
+
+    // See mem_watchdog module docs: three same-signature crashes plus one
+    // manually-killed 75GB-RSS incident in one session, with no visibility
+    // into the memory curve on the way up for any of them. Started here,
+    // right after the panic hook, so it is live for the entire interactive
+    // session including whatever comes next in this function.
+    if let Ok(codex_home) = find_codex_home() {
+        mem_watchdog::spawn(&codex_home);
+    }
+
     let (mut tui, mut terminal_restore_guard, mut startup_draft) = startup_draft.into_parts();
 
     #[cfg(not(debug_assertions))]

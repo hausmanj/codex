@@ -33,6 +33,9 @@ pub const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS: u64 = 15_000;
 const MAX_STREAM_MAX_RETRIES: u64 = 100;
 /// Hard cap for user-configured `request_max_retries`.
 const MAX_REQUEST_MAX_RETRIES: u64 = 100;
+/// Hard cap for user-configured `stream_reconnect_delay_ms`, so a typo (an
+/// extra zero) cannot turn "wait a few seconds" into "hang for hours".
+const MAX_STREAM_RECONNECT_DELAY_MS: u64 = 120_000;
 
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const OPENAI_ACTOR_AUTHORIZATION_HEADER: &str = "x-openai-actor-authorization";
@@ -130,6 +133,23 @@ pub struct ModelProviderInfo {
     pub request_max_retries: Option<u64>,
     /// Number of times to retry reconnecting a dropped streaming response before failing.
     pub stream_max_retries: Option<u64>,
+    /// Minimum delay (in milliseconds) before the FIRST automatic stream
+    /// reconnect attempt, overriding the default ~200ms exponential-backoff
+    /// start. Only applies when the error itself carries no explicit
+    /// retry-after; that still wins.
+    ///
+    /// 2026-08-26: a low `stream_max_retries` (set to 1 for a single local
+    /// server, see mlx.config.toml) combined with the default ~200ms first
+    /// delay means a transient blip gets exactly one reconnect attempt,
+    /// fired near-instantly -- indistinguishable from zero retries if
+    /// whatever caused the blip (a busy single-process local server) hasn't
+    /// cleared in 200ms. This raises the floor on that one attempt's delay
+    /// so it has a real chance to land after the condition clears, without
+    /// touching retry COUNT (a storm of instant retries against one local
+    /// server was the documented failure mode `stream_max_retries=1` in
+    /// mlx.config.toml already exists to prevent; this deliberately does not
+    /// reopen that by adding more attempts, only more time per attempt).
+    pub stream_reconnect_delay_ms: Option<u64>,
     /// Idle timeout (in milliseconds) to wait for activity on a streaming response before treating
     /// the connection as lost.
     pub stream_idle_timeout_ms: Option<u64>,
@@ -371,6 +391,15 @@ impl ModelProviderInfo {
             .min(MAX_STREAM_MAX_RETRIES)
     }
 
+    /// Minimum delay before the first automatic stream reconnect, if this
+    /// provider configures one. `None` means "use the normal exponential
+    /// backoff starting point" -- unchanged behavior for every provider that
+    /// doesn't set this.
+    pub fn stream_reconnect_delay(&self) -> Option<Duration> {
+        self.stream_reconnect_delay_ms
+            .map(|ms| Duration::from_millis(ms.min(MAX_STREAM_RECONNECT_DELAY_MS)))
+    }
+
     /// Effective idle timeout for streaming responses.
     pub fn stream_idle_timeout(&self) -> Duration {
         self.stream_idle_timeout_ms
@@ -415,6 +444,7 @@ impl ModelProviderInfo {
             // Use global defaults for retry/timeout unless overridden in config.toml.
             request_max_retries: None,
             stream_max_retries: None,
+            stream_reconnect_delay_ms: None,
             stream_idle_timeout_ms: None,
             websocket_connect_timeout_ms: None,
             requires_openai_auth: true,
@@ -451,6 +481,7 @@ impl ModelProviderInfo {
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
+            stream_reconnect_delay_ms: None,
             stream_idle_timeout_ms: None,
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
@@ -619,6 +650,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         env_http_headers: None,
         request_max_retries: None,
         stream_max_retries: None,
+        stream_reconnect_delay_ms: None,
         stream_idle_timeout_ms: None,
         websocket_connect_timeout_ms: None,
         requires_openai_auth: false,

@@ -187,6 +187,10 @@ fn model_provider_from_proto(
         env_http_headers: provider.env_http_headers.map(|map| map.values),
         request_max_retries: provider.request_max_retries,
         stream_max_retries: provider.stream_max_retries,
+        // Not present on the wire proto (same reason `aws: None` is hardcoded
+        // just above) -- remote/proto-hydrated providers get the unchanged
+        // default backoff, same as before this field existed.
+        stream_reconnect_delay_ms: None,
         stream_idle_timeout_ms: provider.stream_idle_timeout_ms,
         websocket_connect_timeout_ms: provider.websocket_connect_timeout_ms,
         requires_openai_auth: provider.requires_openai_auth,
@@ -216,6 +220,9 @@ fn model_provider_to_proto(
         env_http_headers,
         request_max_retries,
         stream_max_retries,
+        // Not on the wire proto, same as `aws` and `skip_models_cache` right
+        // below -- discarded on the way to the remote side.
+        stream_reconnect_delay_ms: _,
         stream_idle_timeout_ms,
         websocket_connect_timeout_ms,
         requires_openai_auth,
@@ -565,6 +572,7 @@ mod tests {
             )])),
             request_max_retries: Some(7),
             stream_max_retries: Some(8),
+            stream_reconnect_delay_ms: None,
             stream_idle_timeout_ms: Some(9_000),
             websocket_connect_timeout_ms: Some(10_000),
             requires_openai_auth: false,

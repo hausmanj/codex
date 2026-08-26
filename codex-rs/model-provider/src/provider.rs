@@ -585,6 +585,7 @@ mod tests {
             env_http_headers: None,
             request_max_retries: Some(0),
             stream_max_retries: Some(0),
+            stream_reconnect_delay_ms: None,
             stream_idle_timeout_ms: Some(5_000),
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,

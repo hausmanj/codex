@@ -17,6 +17,47 @@ use tracing::warn;
 const INITIAL_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(5);
 const MAX_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
 
+/// 2026-08-26: John saw codex_tui's RSS climb past 75GB and killed it, on a
+/// session running against the local MLX profile only -- confirmed never
+/// reproduces against normal (OpenAI-hosted) codex. This retry path is the
+/// leading suspect: `UnboundedConnectionRetries` is `default_enabled: true`
+/// and unconditionally live for this profile (not internal, not Bedrock), and
+/// unlike the bounded branch below it has no retry-count ceiling at all on
+/// `ConnectionFailed` -- it can retry forever. A connection genuinely
+/// resetting is far more plausible against a single local uvicorn process
+/// pegged doing MLX inference than against OpenAI's infrastructure, which is
+/// consistent with "only happens locally."
+///
+/// This does not fix a leak -- no leak has been confirmed in this function,
+/// which holds only a few bytes of retry-counter state. It exists so a
+/// retry storm is visible in the SAME timeline as tui's mem_watchdog RSS
+/// log, instead of the two being two separate, uncorrelated blind spots. If
+/// retry lines and RSS-threshold lines climb together next time, that
+/// confirms this path; if RSS climbs with no retry lines nearby, it rules
+/// this path out and points elsewhere.
+fn log_retry_diagnostic(kind: &str, retry_count: u64, delay: Duration, err: &CodexErr) {
+    let Ok(codex_home) = codex_utils_home_dir::find_codex_home() else {
+        return;
+    };
+    let path = codex_home.join("codex-memory.log");
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "unix={unix} pid={} RETRY kind={kind} count={retry_count} delay={delay:?} err={err:#}",
+            std::process::id()
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
     Sampling,
@@ -71,9 +112,15 @@ pub(crate) async fn handle_retryable_response_stream_error(
             ?retry_delay,
             "stream connection failed; waiting to retry"
         );
+        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
+        log_retry_diagnostic(
+            "unbounded_connection",
+            retry_state.connection_retries,
+            retry_delay,
+            &err,
+        );
         sess.notify_stream_error(turn_context, "Reconnecting... waiting for network", err)
             .await;
-        retry_state.connection_retries = retry_state.connection_retries.saturating_add(1);
         codex_client::record_retry!(retry_state.connection_retries, retry_delay, operation);
         tokio::time::sleep(retry_delay).await;
         retry_state.connection_retry_delay = retry_delay
@@ -102,8 +149,22 @@ pub(crate) async fn handle_retryable_response_stream_error(
     if retry_state.retries < max_retries {
         retry_state.retries += 1;
         let retry_count = retry_state.retries;
-        let delay = err.retry_delay().unwrap_or_else(|| backoff(retry_count));
+        // A server-signaled delay (e.g. Retry-After) always wins. Otherwise,
+        // when the provider sets stream_reconnect_delay_ms (mlx-local: a
+        // single local server with stream_max_retries=1, where the default
+        // ~200ms first-attempt backoff is too fast for a transient blip to
+        // actually clear), floor the computed backoff at that value instead
+        // of replacing it -- later attempts (if max_retries > 1) still grow
+        // normally past the floor rather than getting stuck at it.
+        let computed_backoff = backoff(retry_count);
+        let delay = err.retry_delay().unwrap_or_else(|| {
+            match turn_context.provider.info().stream_reconnect_delay() {
+                Some(floor) => computed_backoff.max(floor),
+                None => computed_backoff,
+            }
+        });
         log_retry(request, turn_context, &err, retry_count, max_retries, delay);
+        log_retry_diagnostic("bounded", retry_count, delay, &err);
 
         // In release builds, hide the first websocket retry notification to reduce noisy
         // transient reconnect messages. In debug builds, keep full visibility for diagnosis.

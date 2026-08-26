@@ -310,6 +310,7 @@ mod tests {
             env_http_headers: None,
             request_max_retries: None,
             stream_max_retries: None,
+            stream_reconnect_delay_ms: None,
             stream_idle_timeout_ms: None,
             websocket_connect_timeout_ms: None,
             requires_openai_auth: false,
